@@ -6,7 +6,13 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def get_client():
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return OpenAI(api_key=key)
 
 app = FastAPI()
 app.add_middleware(
@@ -33,6 +39,7 @@ async def chat_json(request: Request):
     if not user_message:
         return JSONResponse({"error":"message is required"}, status_code=400)
 
+    client = get_client()
     resp = client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -53,6 +60,8 @@ async def chat_stream(request: Request):
         return JSONResponse({"error":"message is required"}, status_code=400)
 
     def gen():
+
+        client = get_client()
         stream = client.chat.completions.create(
             model="gpt-4o",
             messages=[
