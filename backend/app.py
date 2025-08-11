@@ -10,12 +10,17 @@ def get_client():
         raise RuntimeError("OPENAI_API_KEY not set")
     return OpenAI(api_key=key)
 
+origins = [ 
+    "https://dturnover.github.io"
+]
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
-    allow_methods=["GET","POST","OPTIONS"],
-    allow_headers=["Content-Type","Authorization"],
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 SYSTEM_PROMPT = (
