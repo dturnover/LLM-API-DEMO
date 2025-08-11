@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>LLM API Demo</title>
+<div style="max-width:700px;margin:40px auto;font:14px system-ui;">
+  <h2>LLM API Demo</h2>
+  <textarea id="msg" rows="4" style="width:100%;padding:10px" placeholder="Type your message..."></textarea>
+  <div style="margin-top:8px">
+    <button id="send">Send</button>
+  </div>
+  <h3 style="margin-top:16px">Response</h3>
+  <pre id="out" style="white-space:pre-wrap;border:1px solid #ddd;border-radius:8px;padding:12px;min-height:120px"></pre>
+</div>
+<script>
+const API_URL = "https://llm-api-demo-5qz1.onrender.com/chat_json";
+
+async function send(){
+  const out = document.getElementById('out');
+  const msg = document.getElementById('msg').value.trim();
+  if(!msg){ out.textContent = "Type something first."; return; }
+  out.textContent = "Loading...";
+  try{
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ message: msg })
+    });
+    const data = await res.json();
+    out.textContent = data.response || JSON.stringify(data);
+  }catch(e){
+    out.textContent = "Error: " + e.message;
+  }
+}
+document.getElementById('send').addEventListener('click', send);
+document.getElementById('msg').addEventListener('keydown', e => { if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }});
+</script>
