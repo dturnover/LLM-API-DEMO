@@ -1,35 +1,48 @@
-<!doctype html>
-<meta charset="utf-8">
-<title>LLM API Demo</title>
-<div style="max-width:700px;margin:40px auto;font:14px system-ui;">
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>LLM API Demo</title>
+</head>
+<body style="font-family: Arial; padding: 20px; max-width: 720px; margin: auto;">
   <h2>LLM API Demo</h2>
-  <textarea id="msg" rows="4" style="width:100%;padding:10px" placeholder="Type your message..."></textarea>
-  <div style="margin-top:8px">
-    <button id="send">Send</button>
-  </div>
-  <h3 style="margin-top:16px">Response</h3>
-  <pre id="out" style="white-space:pre-wrap;border:1px solid #ddd;border-radius:8px;padding:12px;min-height:120px"></pre>
-</div>
-<script>
-const API_URL = "https://llm-api-demo-5qz1.onrender.com/chat_json";
+  <textarea id="message" rows="4" style="width: 100%;" placeholder="Type your message..."></textarea>
+  <br><br>
+  <button onclick="sendMessage()">Send</button>
+  <h3>Response:</h3>
+  <pre id="response" style="white-space: pre-wrap;"></pre>
+  <script>
+const API_URL = "https://llm-api-demo-5qz1.onrender.com/chat"; // streaming endpoint
+
+const log = document.getElementById('log');
+const msg = document.getElementById('msg');
+function append(t){ log.textContent += t; log.scrollTop = log.scrollHeight; }
 
 async function send(){
-  const out = document.getElementById('out');
-  const msg = document.getElementById('msg').value.trim();
-  if(!msg){ out.textContent = "Type something first."; return; }
-  out.textContent = "Loading...";
+  const text = msg.value.trim(); if(!text) return;
+  msg.value = ""; append(`You: ${text}\n\nBot: `);
   try{
     const res = await fetch(API_URL, {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ message: msg })
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ message: text })
     });
-    const data = await res.json();
-    out.textContent = data.response || JSON.stringify(data);
+    if(!res.ok || !res.body){ append(`[error ${res.status}]\n\n`); return; }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      append(decoder.decode(value, { stream: true }));
+    }
+    append("\n\n");
   }catch(e){
-    out.textContent = "Error: " + e.message;
+    append(`[network error: ${e.message}]\n\n`);
   }
 }
-document.getElementById('send').addEventListener('click', send);
-document.getElementById('msg').addEventListener('keydown', e => { if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }});
+document.getElementById('send').onclick = send;
+msg.addEventListener('keydown', e => { if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }});
 </script>
+</body>
+</html>
