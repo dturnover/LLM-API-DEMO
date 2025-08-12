@@ -11,26 +11,38 @@
   <button onclick="sendMessage()">Send</button>
   <h3>Response:</h3>
   <pre id="response" style="white-space: pre-wrap;"></pre>
-
   <script>
-    const API_URL = "https://llm-api-demo-5qz1.onrender.com/chat_json";
+const API_URL = "https://llm-api-demo-5qz1.onrender.com/chat"; // streaming endpoint
 
-    async function sendMessage() {
-      const msg = document.getElementById('message').value;
-      document.getElementById('response').textContent = 'Loading...';
+const log = document.getElementById('log');
+const msg = document.getElementById('msg');
+function append(t){ log.textContent += t; log.scrollTop = log.scrollHeight; }
 
-      try {
-        const res = await fetch(API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: msg })
-        });
-        const data = await res.json();
-        document.getElementById('response').textContent = data.response || 'No response';
-      } catch (err) {
-        document.getElementById('response').textContent = 'Error: ' + err;
-      }
+async function send(){
+  const text = msg.value.trim(); if(!text) return;
+  msg.value = ""; append(`You: ${text}\n\nBot: `);
+  try{
+    const res = await fetch(API_URL, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ message: text })
+    });
+    if(!res.ok || !res.body){ append(`[error ${res.status}]\n\n`); return; }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      append(decoder.decode(value, { stream: true }));
     }
-  </script>
+    append("\n\n");
+  }catch(e){
+    append(`[network error: ${e.message}]\n\n`);
+  }
+}
+document.getElementById('send').onclick = send;
+msg.addEventListener('keydown', e => { if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }});
+</script>
 </body>
 </html>
