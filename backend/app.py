@@ -1,5 +1,6 @@
 import os, json, traceback
 from pathlib import Path
+from typing import Dict, List
 
 import numpy as np
 from fastapi import FastAPI, Request
@@ -7,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import OpenAI
 from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import load_npz
 
 # ========= OpenAI client =========
 def get_client():
@@ -17,8 +19,7 @@ def get_client():
 
 # ========= CORS =========
 origins = [
-    "https://dturnover.github.io",         # GitHub Pages demo
-    # "https://<his-domain.com>",          # add his WP domain when ready
+    "https://dturnover.github.io",
 ]
 app = FastAPI()
 app.add_middleware(
@@ -47,66 +48,98 @@ Behavior:
 Signature touches (use sparingly):
 - “Keep buggering on.” / “We shall never surrender.”
 - Metaphors of storms, resolve, destiny.
-
-Examples:
-User: “How should one face adversity?”
-Assistant: “With unflinching resolve, tempered by prudence. We are not made to yield at the first squall, but to tack and see the voyage through.”
-
-User: “Tell a quick joke.”
-Assistant: “I have often found that the shortest speeches require the longest preparation—mercifully for you, this one is brief.”
-
-Stay in character throughout.
 """
 
-# ========= RAG (precomputed) =========
+SYSTEM_PROMPT += """
+Operational rules for scripture RAG:
+- You are a spiritual guide for fighters.
+- If SOURCES are provided for a specific religion (e.g., Bible or Quran), use ONLY those sources; do not quote from memory.
+- When it helps, proactively include a brief verse (1–3 lines) with an inline citation like [S1], followed by one sentence tying it to the user’s situation.
+- If the user’s preference is unknown, briefly ask once which text they prefer and proceed thereafter.
+"""
+
+# ========= Multi-corpus RAG =========
 BASE_DIR = Path(__file__).resolve().parent
-RAG_DIR = BASE_DIR / "rag_data"
-RAG_EMB = None
-RAG_DOCS = None
-TFIDF = None
-TFIDF_MAT = None
+RAG_ROOT = BASE_DIR / "rag_data"
 
-def load_rag():
-    """Load precomputed embeddings + docs and build TF-IDF matrix for retrieval."""
-    global RAG_EMB, RAG_DOCS, TFIDF, TFIDF_MAT
-    try:
-        emb_path = RAG_DIR / "embeddings.npy"
-        docs_path = RAG_DIR / "docs.json"
-        if not emb_path.exists() or not docs_path.exists():
-            print("RAG: embeddings/docs not found; skipping.")
-            return
-        RAG_EMB = np.load(emb_path)
-        with open(docs_path, "r", encoding="utf-8") as f:
-            RAG_DOCS = json.load(f)
-        TFIDF = TfidfVectorizer(stop_words="english", max_features=20000)
-        TFIDF_MAT = TFIDF.fit_transform([d["text"] for d in RAG_DOCS])
-        print(f"RAG loaded: {len(RAG_DOCS)} chunks; TF-IDF shape {TFIDF_MAT.shape}")
-    except Exception as e:
-        print("RAG load error:", e)
+class CorpusIndex:
+    def __init__(self, name: str, docs: List[dict], tfidf: TfidfVectorizer, tfidf_mat):
+        self.name = name
+        self.docs = docs
+        self.tfidf = tfidf
+        self.tfidf_mat = tfidf_mat  # scipy.sparse CSR
 
-load_rag()
+INDEX: Dict[str, CorpusIndex] = {}
 
-def retrieve_tfidf(query: str, k: int = 5):
-    """Lightweight lexical retrieval (good enough to demo)."""
-    if TFIDF is None or TFIDF_MAT is None or not RAG_DOCS:
-        return []
-    qv = TFIDF.transform([query])                 # (1, V)
-    sims = (TFIDF_MAT @ qv.T).toarray().ravel()   # dense similarity proxy
+def load_all_rag():
+    INDEX.clear()
+    if not RAG_ROOT.exists():
+        print("RAG: root not found; skipping.")
+        return
+    for sub in sorted(p for p in RAG_ROOT.iterdir() if p.is_dir()):
+        try:
+            docs_path = sub / "docs.json"
+            mat_path = sub / "tfidf_matrix.npz"
+            vocab_path = sub / "tfidf_vocabulary.json"
+            if not docs_path.exists():
+                continue
+            with open(docs_path, "r", encoding="utf-8") as f:
+                docs = json.load(f)
+
+            if mat_path.exists() and vocab_path.exists():
+                tfidf_mat = load_npz(mat_path)
+                with open(vocab_path, "r", encoding="utf-8") as f:
+                    vocab = json.load(f)
+                tfidf = TfidfVectorizer(stop_words="english", max_features=20000, vocabulary=vocab)
+            else:
+                tfidf = TfidfVectorizer(stop_words="english", max_features=20000)
+                tfidf_mat = tfidf.fit_transform([d["text"] for d in docs])
+
+            name = sub.name
+            INDEX[name] = CorpusIndex(name=name, docs=docs, tfidf=tfidf, tfidf_mat=tfidf_mat)
+            print(f"RAG loaded: {name} -> {len(docs)} chunks, TF-IDF {tfidf_mat.shape}")
+        except Exception as e:
+            print(f"RAG load error for {sub.name}:", e)
+
+load_all_rag()
+
+def retrieve(query: str, corpus: str, k: int = 5):
+    idx = INDEX.get(corpus)
+    if not idx:
+        return [], corpus
+    qv = idx.tfidf.transform([query])
+    sims = (idx.tfidf_mat @ qv.T).toarray().ravel()
     top_idx = sims.argsort()[::-1][:k]
     hits = []
     for i in top_idx:
         hits.append({
             "score": float(sims[i]),
-            "id": RAG_DOCS[i]["id"],
-            "page": RAG_DOCS[i].get("page"),
-            "text": RAG_DOCS[i]["text"],
+            "id": idx.docs[i]["id"],
+            "page": idx.docs[i].get("page"),
+            "text": idx.docs[i]["text"],
+            "corpus": corpus,
         })
-    return hits
+    return hits, corpus
+
+def auto_select_and_retrieve(query: str, k: int = 5):
+    if not INDEX:
+        return [], None
+    best_name, best_score = None, -1.0
+    for name, idx in INDEX.items():
+        qv = idx.tfidf.transform([query])
+        sims = (idx.tfidf_mat @ qv.T).toarray().ravel()
+        s = float(sims.max()) if sims.size else -1.0
+        if s > best_score:
+            best_score, best_name = s, name
+    if best_name is None:
+        return [], None
+    return retrieve(query, best_name, k)
 
 # ========= Health / diag =========
 @app.get("/")
 def root():
-    return {"ok": True, "message": "API is running", "endpoints": ["/chat (stream)", "/chat_json (non-stream)", "/diag", "/diag_rag", "/chat_rag_json"]}
+    return {"ok": True, "message": "API is running",
+            "endpoints": ["/chat (stream)", "/chat_json (non-stream)", "/diag", "/diag_rag", "/chat_rag_json"]}
 
 @app.get("/diag")
 def diag():
@@ -119,9 +152,8 @@ def diag():
 
 @app.get("/diag_rag")
 def diag_rag():
-    ok = RAG_DOCS is not None and TFIDF_MAT is not None
-    n = len(RAG_DOCS) if RAG_DOCS else 0
-    return {"ok": bool(ok), "chunks": n}
+    corpora = {name: len(idx.docs) for name, idx in INDEX.items()}
+    return {"ok": bool(INDEX), "corpora": corpora}
 
 # ========= Plain JSON chat =========
 @app.post("/chat_json")
@@ -169,7 +201,7 @@ async def chat_stream(request: Request):
                 delta = getattr(chunk.choices[0].delta, "content", None)
                 if delta:
                     yield delta
-            yield ""  # clean close
+            yield ""
 
         return StreamingResponse(gen(), media_type="text/plain")
     except Exception as e:
@@ -180,26 +212,27 @@ async def chat_stream(request: Request):
 @app.post("/chat_rag_json")
 async def chat_rag_json(request: Request):
     """
-    Retrieve top passages from rag_data and answer grounded in them, with inline citations [S1].. .
+    Body: { "message": "...", "religion": "bible|quran|sutta_pitaka" }
     """
     try:
         body = await request.json()
         user_message = (body.get("message") or "").strip()
+        religion = (body.get("religion") or "").strip().lower()
         if not user_message:
             return JSONResponse({"error": "message is required"}, status_code=400)
 
-        # 1) retrieve
-        hits = retrieve_tfidf(user_message, k=5)
+        if religion and religion in INDEX:
+            hits, used = retrieve(user_message, religion, k=5)
+        else:
+            hits, used = auto_select_and_retrieve(user_message, k=5)
 
-        # 2) build context with labels [S1], [S2]...
         context_lines = []
         for i, h in enumerate(hits, start=1):
             label = f"[S{i}]"
             page = f"p{h['page']}" if h.get("page") else ""
-            context_lines.append(f"{label} ({page} {h['id']}) {h['text']}")
+            context_lines.append(f"{label} ({h['corpus']} {page} {h['id']}) {h['text']}")
         context_block = "\n\n".join(context_lines) if context_lines else "No sources found."
 
-        # 3) ask the model, grounded
         grounded_prompt = f"""Use ONLY the sources below to answer. If they are insufficient,
 say so and ask for a more specific passage. Cite sources inline as [S1], [S2], etc.
 
@@ -220,7 +253,7 @@ QUESTION:
             ],
         )
         answer = resp.choices[0].message.content
-        return {"response": answer, "sources": hits}
+        return {"response": answer, "sources": hits, "selected_corpus": used}
     except Exception as e:
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)

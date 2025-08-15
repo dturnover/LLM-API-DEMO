@@ -7,3 +7,4 @@ pypdf
 tiktoken
 numpy
 scikit-learn
+pdfminer.six
