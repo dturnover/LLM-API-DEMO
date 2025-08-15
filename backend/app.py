@@ -1,6 +1,6 @@
 import os, json, traceback
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 from fastapi import FastAPI, Request
@@ -9,8 +9,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from openai import OpenAI
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import load_npz
+from joblib import load
 
-# ========= OpenAI client =========
+# ========= OpenAI client/model =========
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 def get_client():
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -19,7 +22,7 @@ def get_client():
 
 # ========= CORS =========
 origins = [
-    "https://dturnover.github.io",
+    "https://dturnover.github.io",  # add prod domain when ready
 ]
 app = FastAPI()
 app.add_middleware(
@@ -80,17 +83,16 @@ def load_all_rag():
         try:
             docs_path = sub / "docs.json"
             mat_path = sub / "tfidf_matrix.npz"
-            vocab_path = sub / "tfidf_vocabulary.json"
+            vec_path = sub / "tfidf_vectorizer.joblib"
             if not docs_path.exists():
                 continue
+
             with open(docs_path, "r", encoding="utf-8") as f:
                 docs = json.load(f)
 
-            if mat_path.exists() and vocab_path.exists():
-                tfidf_mat = load_npz(mat_path)
-                with open(vocab_path, "r", encoding="utf-8") as f:
-                    vocab = json.load(f)
-                tfidf = TfidfVectorizer(stop_words="english", max_features=20000, vocabulary=vocab)
+            if vec_path.exists():
+                tfidf = load(vec_path)  # fitted vectorizer
+                tfidf_mat = load_npz(mat_path) if mat_path.exists() else tfidf.fit_transform([d["text"] for d in docs])
             else:
                 tfidf = TfidfVectorizer(stop_words="english", max_features=20000)
                 tfidf_mat = tfidf.fit_transform([d["text"] for d in docs])
@@ -166,7 +168,7 @@ async def chat_json(request: Request):
 
         client = get_client()
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -190,7 +192,7 @@ async def chat_stream(request: Request):
 
         def gen():
             stream = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
@@ -245,7 +247,7 @@ QUESTION:
 
         client = get_client()
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL,
             temperature=0.3,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT + " Always ground answers in the provided sources when available."},
