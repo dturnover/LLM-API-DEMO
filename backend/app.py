@@ -1,33 +1,30 @@
 import os, json, re, uuid, traceback
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Iterable, Tuple
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response, PlainTextResponse
 from openai import OpenAI
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import load_npz
 import joblib
-import tiktoken
 
-# ========= OpenAI client / model =========
+# ========= OpenAI client =========
 def get_client():
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY not set")
     return OpenAI(api_key=key)
 
-def pick_model() -> str:
-    m = (os.getenv("OPENAI_MODEL") or "").strip()
-    if not m or m.startswith("test-"):
-        return "gpt-4o-mini"
-    return m
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_HISTORY_TURNS = 12  # user+assistant pairs kept in session
+MAX_STICKY = 30         # max sticky notes to remember
 
-# ========= CORS / FastAPI =========
+# ========= CORS =========
 origins = [
-    "https://dturnover.github.io",
+    "https://dturnover.github.io",  # GitHub Pages demo
 ]
 app = FastAPI()
 app.add_middleware(
@@ -40,33 +37,30 @@ app.add_middleware(
 
 # ========= Persona =========
 SYSTEM_PROMPT = """
-You are “Winston Churchill GPT,” speaking in the voice and manner of Sir Winston Churchill.
+You are “Winston Churchill GPT,” a conversational assistant speaking in the voice and manner of Sir Winston Churchill.
 
-Style:
-- Eloquent, oratorical; occasionally wry. Avoid modern slang.
+Voice & Style:
+- Formal, eloquent, oratorical; occasionally wry.
+- Uses period-appropriate phrasing; avoid anachronisms and modern slang.
 - Concise for direct questions; expansive when invited to opine.
 
-Grounding & Citations:
-- If a “Sources” block is appended to the user message (with [S1], [S2], …), you MUST ground your answer ONLY in those sources and cite inline as [S1], [S2], etc.
-- If there is NO Sources block, DO NOT mention sources or citations at all.
-- When faith is known (Bible/Qur’an/Sutta Pitaka), prefer verses matching the user’s request (e.g., courage, patience, hope).
+Behavior:
+- If unclear, ask a brief clarifying question.
+- If asked about post-1965 events, respond hypothetically from Churchill’s perspective, and note the limitation.
+- Be courteous and refuse harmful requests.
 
-Memory:
-- Respect the Conversation Summary and Sticky Notes provided by the system as high-priority context.
-- Treat those facts as true unless the user corrects them.
-
-Safety:
-- Decline harmful or hateful requests firmly but courteously.
+Grounding:
+- When a “Sources” block is provided, treat it as authoritative context for this reply and, when quoting, cite inline as [S1], [S2], etc. If insufficient, say so briefly.
+- When “Sticky Notes” are provided, treat them as facts remembered about the current user; use them naturally if relevant (do not cite stickies).
 
 Stay in character throughout.
 """.strip()
 
-# ========= Session (in-memory) =========
+# ========= Session store (in-memory per process) =========
 # sid -> {
 #   "religion": Optional[str],
-#   "history": List[{"role":"user"|"assistant", "content": str}],
-#   "summary": str,
-#   "sticky": List[str],
+#   "sticky": Dict[str, str],
+#   "history": List[Dict[str, str]]  # [{"role":"user"/"assistant","content": "..."}]
 # }
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
@@ -74,12 +68,20 @@ def get_or_create_sid(request: Request) -> str:
     sid = request.cookies.get("sid")
     if not sid or sid not in SESSIONS:
         sid = uuid.uuid4().hex
-        SESSIONS[sid] = {"religion": None, "history": [], "summary": "", "sticky": []}
+        SESSIONS[sid] = {"religion": None, "sticky": {}, "history": []}
     return sid
+
+def add_history(sid: str, role: str, content: str):
+    h = SESSIONS[sid]["history"]
+    h.append({"role": role, "content": content})
+    # keep last MAX_HISTORY_TURNS * 2 messages (user+assistant pairs)
+    max_msgs = MAX_HISTORY_TURNS * 2
+    if len(h) > max_msgs:
+        del h[: len(h) - max_msgs]
 
 # ========= Religion detection =========
 RELIGION_MAP = {
-    "bible": "bible", "christian": "bible", "christianity": "bible", "jesus": "bible",
+    "bible": "bible", "christian": "bible", "christianity": "bible", "jesus": "bible", "gospel": "bible",
     "quran": "quran", "koran": "quran", "muslim": "quran", "islam": "quran", "allah": "quran",
     "buddhist": "sutta_pitaka", "buddhism": "sutta_pitaka", "sutta": "sutta_pitaka",
     "pitaka": "sutta_pitaka", "pali": "sutta_pitaka", "dhamma": "sutta_pitaka",
@@ -95,100 +97,35 @@ def detect_religion(text: str) -> Optional[str]:
         return RELIGION_MAP.get(m.group(2), None)
     return None
 
-# ========= Sticky note extraction (simple) =========
-STICKY_PATTS = [
-    r"\bremember that (.+)",
-    r"\bplease remember (.+)",
-    r"\bnote that (.+)",
-    r"\bkeep in mind that (.+)",
+# ========= Sticky Notes (simple memory) =========
+def normalize_key(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s[:120]
+
+REMEMBER_PATTERNS = [
+    re.compile(r"^\s*remember that\s+(.+?)\s+(?:is|=|:)\s+(.+?)\s*$", re.I),
+    re.compile(r"^\s*remember\s+(.+?)\s+(?:is|=|:)\s+(.+?)\s*$", re.I),
+    re.compile(r"^\s*please remember\s+(.+?)\s+(?:is|=|:)\s+(.+?)\s*$", re.I),
 ]
 
-def extract_sticky_notes(text: str) -> List[str]:
-    t = text.lower()
-    out = []
-    for p in STICKY_PATTS:
-        m = re.search(p, t)
+def extract_sticky(message: str) -> Optional[tuple[str, str]]:
+    for pat in REMEMBER_PATTERNS:
+        m = pat.match(message)
         if m:
-            val = m.group(1).strip().rstrip(".! ")
-            if val:
-                out.append(val)
-    return out
+            key = normalize_key(m.group(1))
+            val = m.group(2).strip()
+            # simple guardrails (avoid storing long/injected blobs)
+            if 1 <= len(key) <= 120 and 1 <= len(val) <= 200:
+                return key, val
+    return None
 
-# ========= Token accounting & memory window =========
-def count_tokens(messages: List[Dict[str, str]], model: str) -> int:
-    try:
-        enc = tiktoken.encoding_for_model(model)
-    except Exception:
-        enc = tiktoken.get_encoding("cl100k_base")
-    total = 0
-    # rough accounting for ChatML-like format
-    for m in messages:
-        total += 4  # role + overhead
-        total += len(enc.encode(m.get("content") or ""))
-    total += 2
-    return total
-
-def trim_history_for_budget(
-    base_msgs: List[Dict[str, str]],
-    summary: str,
-    history: List[Dict[str, str]],
-    new_user: Dict[str, str],
-    model: str,
-    max_tokens: int = 7000,
-    reserve_for_output: int = 600,
-) -> Tuple[List[Dict[str,str]], str, List[Dict[str,str]]]:
-    """
-    Build a message list fitting within token budget:
-    [system, summary?, sticky?, ...history_tail..., new_user]
-    Returns (messages_without_new_user, summary_text, history_tail)
-    """
-    msgs: List[Dict[str, str]] = base_msgs.copy()
-
-    if summary:
-        msgs.append({"role": "system", "content": f"Conversation Summary:\n{summary}"})
-
-    # we add history tail from the end until budget nearly hit
-    tail: List[Dict[str, str]] = []
-    for m in reversed(history):
-        candidate = msgs + list(reversed(tail)) + [m, new_user]
-        if count_tokens(candidate, model) < (max_tokens - reserve_for_output):
-            tail.insert(0, m)
-        else:
-            break
-
-    return msgs + tail, summary, tail
-
-def summarize_past(client: OpenAI, model: str, summary: str, overflow: List[Dict[str,str]]) -> str:
-    """
-    Compress older messages into an updated summary.
-    """
-    # build text of overflow
-    text = ""
-    for m in overflow:
-        prefix = "User" if m["role"] == "user" else "Assistant"
-        text += f"{prefix}: {m['content']}\n"
-    prompt = (
-        "Summarize the following prior dialogue into crisp bullets with concrete facts/preferences, "
-        "so a chatbot can remember them for future turns. Keep under 120 words. "
-        "If there are user-stated facts to remember (e.g., 'the penguin is painted blue'), include them verbatim.\n\n"
-        f"Existing summary (may be empty):\n{summary or '(none)'}\n\n"
-        f"New dialogue to fold in:\n{text}"
-    )
-    try:
-        comp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You compress chat history into compact factual summaries."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=180,
-        )
-        return comp.choices[0].message.content.strip()
-    except Exception:
-        # fallback: append raw lines truncated
-        joined = text.strip().splitlines()
-        return (summary + "\n" + "\n".join(joined[-8:])).strip()
+def render_sticky_block(sticky: Dict[str, str]) -> str:
+    if not sticky:
+        return "Sticky Notes: (none)"
+    lines = [f"- {k}: {v}" for k, v in sticky.items()]
+    return "Sticky Notes:\n" + "\n".join(lines)
 
 # ========= RAG load (multi-corpus) =========
 BASE_DIR = Path(__file__).resolve().parent
@@ -221,59 +158,16 @@ def load_all_corpora():
 
 load_all_corpora()
 
-# ========= Retrieval helpers =========
-JUNK_PATTERNS = [
-    r"Downloaded from www\.holybooks\.com",
-    r"^Page \d+",
-    r"^\s*The Book of .*",
-]
-JUNK_RE = re.compile("|".join(JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE)
-
-KEYWORD_HINTS = {
-    "courage": ["courage", "be strong", "fear not", "dismayed", "valour", "bold"],
-    "strength": ["strength", "mighty", "power", "fortify", "be strong"],
-    "patience": ["patience", "patient", "steadfast", "sabr", "persevere"],
-    "hope": ["hope", "mercy", "deliver", "trust", "faithfulness"],
-}
-
-def want_verse(text: str) -> bool:
-    t = text.lower()
-    return any(w in t for w in ["verse", "scripture", "quote", "passage", "ayah"])
-
-def hint_terms(text: str) -> List[str]:
-    t = text.lower()
-    bag = []
-    for k, words in KEYWORD_HINTS.items():
-        if k in t:
-            bag.extend(words)
-    return bag
-
-def _filter_hits(hits: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    keep = []
-    for h in hits:
-        txt = h["text"]
-        if JUNK_RE.search(txt):
-            continue
-        if len(txt.strip()) < 60:
-            continue
-        keep.append(h)
-    return keep
-
-def retrieve_tfidf(query: str, corpus: str, k: int = 5, extra_terms: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def retrieve_tfidf(query: str, corpus: str, k: int = 5) -> List[Dict[str, Any]]:
     c = CORPORA.get(corpus)
     if not c:
         return []
     tfidf: TfidfVectorizer = c["tfidf"]
     tfidf_mat = c["tfidf_mat"]
     docs = c["docs"]
-
-    q = query
-    if extra_terms:
-        q += " " + " ".join(extra_terms)
-
-    qv = tfidf.transform([q])                # (1, V)
+    qv = tfidf.transform([query])
     sims = (tfidf_mat @ qv.T).toarray().ravel()
-    top_idx = sims.argsort()[::-1][:max(k*3, 10)]
+    top_idx = sims.argsort()[::-1][:k]
     hits = []
     for i in top_idx:
         hits.append({
@@ -283,41 +177,72 @@ def retrieve_tfidf(query: str, corpus: str, k: int = 5, extra_terms: Optional[Li
             "text": docs[i]["text"],
             "corpus": corpus,
         })
-    hits = _filter_hits(hits)[:k]
     return hits
-
-def retrieve_best_across(query: str, k: int = 5, extra_terms: Optional[List[str]] = None):
-    best: List[Dict[str, Any]] = []
-    best_name = None
-    best_topscore = -1.0
-    for name in CORPORA.keys():
-        hits = retrieve_tfidf(query, name, k=k, extra_terms=extra_terms)
-        if not hits:
-            continue
-        if hits[0]["score"] > best_topscore:
-            best_topscore = hits[0]["score"]
-            best = hits
-            best_name = name
-    return best_name, best
 
 def build_sources_block(hits: List[Dict[str, Any]]) -> str:
     if not hits:
-        return ""
+        return "Sources: (none)"
     lines = []
     for i, h in enumerate(hits, start=1):
-        label = f"[S{i}]"
         page = f"p{h['page']}" if h.get("page") else ""
-        lines.append(f"{label} ({page} {h['id']}) {h['text']}")
-    return "\n\n".join(lines)
+        lines.append(f"[S{i}] ({page} {h['id']}) {h['text']}")
+    return "Sources:\n" + "\n\n".join(lines)
 
-def sources_event(hits: List[Dict[str, Any]], selected_corpus: Optional[str]) -> str:
-    payload = {"sources": hits, "selected_corpus": selected_corpus}
-    return json.dumps(payload, ensure_ascii=False)
+# ========= Helpers =========
+def build_messages(sid: str, user_text: str, hits: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    sticky_block = render_sticky_block(SESSIONS[sid]["sticky"])
+    sources_block = build_sources_block(hits)
+    # Compose:
+    msgs: List[Dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": sticky_block},
+        {"role": "system", "content": sources_block},
+    ]
+    # history
+    msgs.extend(SESSIONS[sid]["history"])
+    # current user
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
 
-# ========= Health =========
+def select_hits_for_message(sid: str, message: str) -> List[Dict[str, Any]]:
+    corpus = SESSIONS[sid].get("religion")
+    if not corpus:
+        # opportunistically set religion if message hints it
+        maybe = detect_religion(message)
+        if maybe:
+            SESSIONS[sid]["religion"] = maybe
+            corpus = maybe
+    # Heuristic: retrieve if a corpus is set AND the message looks like it could use scripture,
+    # or if the user explicitly asks for verse/scripture.
+    if not corpus:
+        return []
+    triggers = ("verse", "scripture", "quote", "bible", "quran", "sutta", "sutra", "teachings", "patience", "courage", "fear", "hope", "strength")
+    needs = any(w in message.lower() for w in triggers)
+    # Also retrieve if prior assistant used a citation recently
+    recent_cited = any("[S" in (m["content"] or "") for m in SESSIONS[sid]["history"][-4:] if m["role"] == "assistant")
+    if needs or recent_cited:
+        return retrieve_tfidf(message, corpus, k=5)
+    return []
+
+def sse_encode(event: Optional[str], data: str) -> bytes:
+    # Server-Sent Events framing
+    out = []
+    if event:
+        out.append(f"event: {event}")
+    # split long lines
+    for line in data.splitlines() or [""]:
+        out.append(f"data: {line}")
+    out.append("")  # end of message
+    return ("\n".join(out) + "\n").encode("utf-8")
+
+# ========= Endpoints =========
 @app.get("/")
 def root():
-    return {"ok": True, "message": "API is running", "endpoints": ["/chat_sse", "/chat_rag_json", "/diag", "/diag_rag"]}
+    return {
+        "ok": True,
+        "message": "API is running",
+        "endpoints": ["/chat_json", "/chat_sse", "/diag", "/diag_rag"]
+    }
 
 @app.get("/diag")
 def diag():
@@ -333,195 +258,145 @@ def diag_rag():
     corpora = {k: (len(v.get("docs") or [])) for k, v in CORPORA.items()}
     return {"ok": True, "corpora": corpora}
 
-# ========= SSE chat (with memory) =========
+# ---- JSON (non-stream) ----
+@app.post("/chat_json")
+async def chat_json(request: Request):
+    try:
+        body = await request.json()
+        user_text: str = (body.get("message") or "").strip()
+        if not user_text:
+            return JSONResponse({"error": "message is required"}, status_code=400)
+
+        sid = get_or_create_sid(request)
+
+        # Sticky “remember …”?
+        remembered = None
+        kv = extract_sticky(user_text)
+        if kv:
+            k, v = kv
+            sticky = SESSIONS[sid]["sticky"]
+            if len(sticky) >= MAX_STICKY and k not in sticky:
+                # drop oldest by insertion order
+                oldest_key = next(iter(sticky.keys()))
+                sticky.pop(oldest_key, None)
+            sticky[k] = v
+            remembered = {"key": k, "value": v}
+
+        # Religion override from body?
+        chosen = body.get("religion")
+        if isinstance(chosen, str) and chosen.lower() in CORPORA:
+            SESSIONS[sid]["religion"] = chosen.lower()
+
+        # Auto-detect religion if user hints it
+        maybe = detect_religion(user_text)
+        if maybe:
+            SESSIONS[sid]["religion"] = maybe
+
+        hits = select_hits_for_message(sid, user_text)
+        msgs = build_messages(sid, user_text, hits)
+
+        client = get_client()
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=msgs,
+            temperature=0.7,
+        )
+        text = resp.choices[0].message.content or ""
+
+        # update history
+        add_history(sid, "user", user_text)
+        add_history(sid, "assistant", text)
+
+        payload = {"response": text, "sources": hits, "selected_corpus": SESSIONS[sid]["religion"], "remembered": remembered}
+        r = JSONResponse(payload)
+        # ensure cookie is set
+        if not request.cookies.get("sid"):
+            r.set_cookie("sid", sid, httponly=True, samesite="lax", path="/")
+        return r
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ---- SSE streaming ----
 @app.post("/chat_sse")
 async def chat_sse(request: Request):
     try:
         body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        user_text: str = (body.get("message") or "").strip()
+        if not user_text:
+            return PlainTextResponse("Bad Request: message is required", status_code=400)
 
-    user_msg: str = (body.get("message") or "").strip()
-    if not user_msg:
-        return JSONResponse({"error": "Missing 'message'."}, status_code=400)
+        sid = get_or_create_sid(request)
 
-    sid = get_or_create_sid(request)
-    sess = SESSIONS[sid]
+        # Sticky remember?
+        remembered = None
+        kv = extract_sticky(user_text)
+        if kv:
+            k, v = kv
+            sticky = SESSIONS[sid]["sticky"]
+            if len(sticky) >= MAX_STICKY and k not in sticky:
+                oldest_key = next(iter(sticky.keys()))
+                sticky.pop(oldest_key, None)
+            sticky[k] = v
+            remembered = {"key": k, "value": v}
 
-    # Update religion if the user hints it
-    detected = detect_religion(user_msg)
-    if detected:
-        sess["religion"] = detected
+        # Optional religion override in payload
+        chosen = body.get("religion")
+        if isinstance(chosen, str) and chosen.lower() in CORPORA:
+            SESSIONS[sid]["religion"] = chosen.lower()
 
-    # Capture sticky notes (optional but helpful)
-    notes = extract_sticky_notes(user_msg)
-    if notes:
-        for n in notes:
-            if n not in sess["sticky"]:
-                sess["sticky"].append(n)
+        # Auto-detect
+        maybe = detect_religion(user_text)
+        if maybe:
+            SESSIONS[sid]["religion"] = maybe
 
-    # Retrieval decision
-    model = pick_model()
-    client = get_client()
+        hits = select_hits_for_message(sid, user_text)
+        msgs = build_messages(sid, user_text, hits)
 
-    extra = hint_terms(user_msg)
-    want_scripture = want_verse(user_msg)
-
-    selected_corpus: Optional[str] = sess.get("religion")
-    hits: List[Dict[str, Any]] = []
-
-    clarify_needed = False
-    auto_note = None
-
-    if selected_corpus:
-        if want_scripture:
-            hits = retrieve_tfidf(user_msg, selected_corpus, k=4, extra_terms=extra)
-    else:
-        if want_scripture:
-            name, best = retrieve_best_across(user_msg, k=4, extra_terms=extra)
-            if name and best and best[0]["score"] >= 0.28:
-                selected_corpus = name
-                hits = best
-                auto_note = f"(Since you haven’t told me your tradition yet, I’m sharing a fitting verse from the {name.replace('_', ' ')}. You can say “Bible”, “Qur’an”, or “Suttas” to switch.)"
-            else:
-                clarify_needed = True
-
-    # Build Sources block (only if hits)
-    source_block = build_sources_block(hits) if hits else ""
-
-    # Build current user turn (augmented if sources)
-    augmented_user = user_msg + ("\n\n---\nSources:\n" + source_block if source_block else "")
-
-    # ===== Build message list with MEMORY =====
-    base_msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    # Sticky are high-priority facts
-    if sess.get("sticky"):
-        base_msgs.append({"role": "system", "content": "Sticky Notes (persist across this session):\n- " + "\n- ".join(sess["sticky"])})
-
-    # Decide the "new user turn" content (clarify or normal)
-    new_user_content = (
-        f"{user_msg}\n\n—\nBefore I pull scripture: which tradition should I draw from—Bible, Qur’an, or the Sutta Pitaka?"
-        if clarify_needed else
-        (auto_note + "\n\n" + augmented_user if auto_note else augmented_user)
-    )
-    new_user = {"role": "user", "content": new_user_content}
-
-    # Trim history to fit budget
-    msgs_wo_new, summary_text, history_tail = trim_history_for_budget(
-        base_msgs, sess.get("summary", ""), sess.get("history", []), new_user, model
-    )
-    messages = msgs_wo_new + [new_user]
-
-    # ===== Stream response and record assistant text into history =====
-    async def token_stream():
-        yield ": connected\n\n"
-        buf = []
-        try:
-            with client.chat.completions.stream(
-                model=model,
-                messages=messages,
-                temperature=0.4,
-                max_tokens=450,
-            ) as stream:
-                for event in stream:
-                    if event.type == "token":
-                        tok = event.token
-                        buf.append(tok)
-                        yield f"data: {tok}\n\n"
-                    elif event.type == "completed":
-                        break
-                yield "data: [DONE]\n\n"
-        except Exception as e:
-            err = str(e)
-            yield f"data: [ERROR] {err}\n\n"
-
-        # Emit sources after text if we used RAG
-        if hits:
-            yield "event: sources\n"
-            yield f"data: {sources_event(hits, selected_corpus)}\n\n"
-
-        # ====== Update memory (history + summary) ======
-        try:
-            # Append the turn we just handled
-            # 1) user
-            sess["history"].append({"role": "user", "content": new_user_content})
-            # 2) assistant (concatenate streamed tokens)
-            assistant_text = "".join(buf).strip()
-            sess["history"].append({"role": "assistant", "content": assistant_text})
-
-            # Keep recent tail length reasonable
-            # If history grows large, fold older part into summary
-            if len(sess["history"]) > 20:
-                # overflow = everything except last 10 messages
-                overflow = sess["history"][:-10]
-                sess["history"] = sess["history"][-10:]
-                sess["summary"] = summarize_past(client, model, sess.get("summary", ""), overflow)
-
-        except Exception:
-            # Never crash the stream for memory bookkeeping issues
-            pass
-
-    resp = StreamingResponse(token_stream(), media_type="text/event-stream")
-    resp.set_cookie("sid", sid, httponly=True, samesite="Lax")
-    return resp
-
-# ========= Non-stream JSON (debug) =========
-@app.post("/chat_rag_json")
-def chat_rag_json(body: Dict[str, Any], request: Request = None):
-    try:
-        user_msg: str = (body.get("message") or "").strip()
-        chosen: Optional[str] = body.get("religion")
-        if not user_msg:
-            return JSONResponse({"error": "Missing 'message'."}, status_code=400)
-
-        # Optional: include session memory here, too
-        # If request exists, honor its cookie session
-        sid = None
-        sess = {"history": [], "summary": "", "sticky": []}
-        if request:
-            sid = request.cookies.get("sid")
-            if sid and sid in SESSIONS:
-                sess = SESSIONS[sid]
-
-        extra = hint_terms(user_msg)
-        if chosen:
-            if chosen not in CORPORA:
-                return JSONResponse({"error": f"Unknown religion '{chosen}'."}, status_code=400)
-            hits = retrieve_tfidf(user_msg, chosen, k=4, extra_terms=extra)
-            selected = chosen
-        else:
-            selected, hits = retrieve_best_across(user_msg, k=4, extra_terms=extra)
-
-        source_block = build_sources_block(hits) if hits else ""
-        model = pick_model()
         client = get_client()
-
-        sys = SYSTEM_PROMPT
-        msgs = [{"role": "system", "content": sys}]
-        if sess.get("sticky"):
-            msgs.append({"role": "system", "content": "Sticky Notes:\n- " + "\n- ".join(sess["sticky"])})
-        if sess.get("summary"):
-            msgs.append({"role": "system", "content": "Conversation Summary:\n" + sess["summary"]})
-        # use tail of history (without overcomplicating tokens here)
-        for m in sess.get("history", [])[-8:]:
-            msgs.append(m)
-
-        user = user_msg + ("\n\n---\nSources:\n" + source_block if source_block else "")
-        msgs.append({"role": "user", "content": user})
-
-        comp = client.chat.completions.create(
-            model=model,
+        stream = client.chat.completions.create(
+            model=MODEL,
             messages=msgs,
-            temperature=0.4,
-            max_tokens=450,
+            temperature=0.7,
+            stream=True,
         )
-        text = comp.choices[0].message.content
-        return {"response": text, "sources": hits, "selected_corpus": selected}
+
+        def gen():
+            # initial ping
+            yield sse_encode(None, ": connected").decode("utf-8").encode("utf-8")
+            try:
+                full = []
+                for chunk in stream:
+                    for choice in chunk.choices:
+                        delta = getattr(choice, "delta", None)
+                        if delta and delta.content:
+                            full.append(delta.content)
+                            yield sse_encode(None, delta.content)
+                # done
+                yield sse_encode(None, "[DONE]")
+                # sources event (after content so UIs can render)
+                yield sse_encode("sources", json.dumps({
+                    "sources": hits,
+                    "selected_corpus": SESSIONS[sid]["religion"],
+                    "remembered": remembered
+                }))
+            except Exception as ex:
+                err = f"{ex}"
+                yield sse_encode(None, json.dumps({"error": err}))
+            finally:
+                # update history
+                try:
+                    final_text = "".join(full) if full else ""
+                    add_history(sid, "user", user_text)
+                    if final_text:
+                        add_history(sid, "assistant", final_text)
+                except Exception:
+                    pass
+
+        resp = StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8")
+        if not request.cookies.get("sid"):
+            resp.set_cookie("sid", sid, httponly=True, samesite="lax", path="/")
+        return resp
     except Exception as e:
-        if str(e).startswith("test-") or "model_not_found" in str(e):
-            return JSONResponse(
-                {"error": "Invalid OPENAI_MODEL. Set a real model (e.g., gpt-4o-mini) or unset the variable."},
-                status_code=500,
-            )
+        traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
