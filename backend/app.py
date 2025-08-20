@@ -1,4 +1,4 @@
-import os, json, re, uuid, traceback, time
+import os, json, re, uuid, traceback
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -20,12 +20,12 @@ def get_client():
     return OpenAI(api_key=key)
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-STREAM_FLUSH_CHARS = 120  # coalesce SSE tokens ~120 chars
+STREAM_FLUSH_CHARS = 160  # coalesce SSE tokens for smoother output
 
 # ===================== CORS / App =====================
 origins = [
-    "https://dturnover.github.io",  # your demo site
-    # add your prod site(s) here as needed
+    "https://dturnover.github.io",  # GitHub Pages demo
+    # add more origins if you deploy elsewhere
 ]
 
 app = FastAPI()
@@ -52,13 +52,16 @@ Behavior:
 - If asked about post-1965 events, respond hypothetically from Churchill’s perspective, noting the time limitation.
 - If asked to produce harmful or hateful content, decline firmly but courteously.
 
-When sources are provided, ground your answer ONLY in those sources, citing inline as [S1], [S2], etc. If insufficient, say so and ask for a more specific passage.
+Grounding & Sources:
+- When a Sources block is provided, ANSWER USING ONLY THOSE SOURCES. Place inline citations in the text as [S1], [S2], etc., immediately after the supported sentence/phrase. If the Sources are insufficient, say so briefly and ask for a more specific passage.
+- Never claim you “cannot quote” a text if a Sources block includes it.
+
 Stay in character.
 """.strip()
 
 # ===================== Sessions / Memory =====================
 SESSIONS: Dict[str, Dict[str, Any]] = {}  # sid -> {"religion": str|None, "history": [msgs], "sticky": Dict[str,str]}
-MAX_HISTORY_MSGS = 12  # rolling window (user+assistant messages)
+MAX_HISTORY_MSGS = 12  # rolling window
 
 def get_or_create_sid(request: Request) -> str:
     sid = request.cookies.get("sid")
@@ -67,14 +70,9 @@ def get_or_create_sid(request: Request) -> str:
         SESSIONS[sid] = {"religion": None, "history": [], "sticky": {}}
     return sid
 
-def session(request: Request) -> Dict[str, Any]:
-    sid = get_or_create_sid(request)
-    return SESSIONS[sid]
-
 def add_history(sid: str, role: str, content: str):
     h = SESSIONS[sid]["history"]
     h.append({"role": role, "content": content})
-    # trim to last N messages
     if len(h) > MAX_HISTORY_MSGS:
         del h[: len(h) - MAX_HISTORY_MSGS]
 
@@ -96,14 +94,20 @@ def detect_religion(text: str) -> Optional[str]:
         return RELIGION_MAP.get(m.group(2), None)
     return None
 
-def is_set_faith_message(text: str) -> bool:
-    return detect_religion(text) is not None
+# Per-turn override if the user explicitly names a scripture family.
+def detect_corpus_override(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    if re.search(r"\b(qur'?an|koran|ayat|surah|sura)\b", t):
+        return "quran"
+    if re.search(r"\b(bible|psalm|proverb|gospel|epistle|scripture)\b", t):
+        return "bible"
+    if re.search(r"\b(sutta|sutra|pitaka|pali canon|dhamma)\b", t):
+        return "sutta_pitaka"
+    return None
 
 # ===================== RAG load (multi-corpus) =====================
 BASE_DIR = Path(__file__).resolve().parent
 RAG_DIR = BASE_DIR / "rag_data"
-
-# CORPORA[name] = {"docs": List[dict], "tfidf": TfidfVectorizer, "tfidf_mat": csr_matrix}
 CORPORA: Dict[str, Dict[str, Any]] = {}
 
 def load_all_corpora():
@@ -139,8 +143,8 @@ def retrieve_tfidf(query: str, corpus: str, k: int = 5) -> List[Dict[str, Any]]:
     tfidf: TfidfVectorizer = c["tfidf"]
     tfidf_mat = c["tfidf_mat"]
     docs = c["docs"]
-    qv = tfidf.transform([query])                # (1, V)
-    sims = (tfidf_mat @ qv.T).toarray().ravel()  # simple similarity proxy
+    qv = tfidf.transform([query])
+    sims = (tfidf_mat @ qv.T).toarray().ravel()
     top_idx = sims.argsort()[::-1][:k]
     hits = []
     for i in top_idx:
@@ -159,18 +163,17 @@ def build_sources_block(hits: List[Dict[str, Any]]) -> str:
         label = f"[S{i}]"
         page = f"p{h['page']}" if h.get("page") else ""
         lines.append(f"{label} ({page} {h['id']}) {h['text']}")
-    return "\n\n".join(lines) if lines else "No sources found."
+    return "\n\n".join(lines) if lines else ""
 
 # ===================== Scripture gating =====================
 SCRIPTURE_TERMS = re.compile(
-    r"\b(verse|scripture|psalm|proverb|qur'?an|koran|ayat|hadith|sutta|sutra|cite|citation|reference)\b|\[s\d*\]",
+    r"\b(verse|scripture|psalm|proverb|qur'?an|koran|ayat|surah|sutta|sutra|pitaka|cite|citation|reference)\b|\[s\d*\]",
     re.IGNORECASE,
 )
 
 def wants_scripture(msg: str, selected_corpus: Optional[str]) -> bool:
     if SCRIPTURE_TERMS.search(msg or ""):
         return True
-    # Also trigger if user says "from the <corpus>"
     if selected_corpus:
         key = {
             "bible": r"\bfrom the (holy )?bible|from scripture|according to (paul|moses|psalms|proverbs|gospel)\b",
@@ -186,22 +189,18 @@ REMEMBER_PAT = re.compile(r"\bremember that\s+(.*?)\s+is\s+(.*)", re.IGNORECASE)
 REMEMBER_SIMPLE = re.compile(r"\bremember\s+(.+)", re.IGNORECASE)
 
 def handle_memory_update(sid: str, user_text: str) -> Optional[Tuple[str, str]]:
-    """Return (key, value) if a memory was added."""
     m = REMEMBER_PAT.search(user_text)
     if m:
         key = m.group(1).strip().lower()
         val = m.group(2).strip()
         SESSIONS[sid]["sticky"][key] = val
-        # keep at most 6
         if len(SESSIONS[sid]["sticky"]) > 6:
-            # drop oldest
             drop_key = next(iter(SESSIONS[sid]["sticky"].keys()))
             SESSIONS[sid]["sticky"].pop(drop_key, None)
         return key, val
     m2 = REMEMBER_SIMPLE.search(user_text)
     if m2:
         text = m2.group(1).strip()
-        # naive split "X: Y" or "X = Y"
         if ":" in text:
             k, v = text.split(":", 1)
             k, v = k.strip().lower(), v.strip()
@@ -215,52 +214,33 @@ def sticky_block(sid: str) -> str:
         return "None"
     return "; ".join([f"{k} → {v}" for k, v in mem.items()])
 
-# ===================== Token budgeting (trim history) =====================
+# ===================== Token budgeting =====================
 def trim_history_for_model(system_prompt: str, sticky: str, history: List[Dict[str, str]], user_msg: str, model: str = MODEL) -> List[Dict[str, str]]:
-    enc = tiktoken.encoding_for_model("gpt-4o-mini") if "gpt-4" in model else tiktoken.get_encoding("cl100k_base")
-    # Build candidate messages
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except Exception:
+        enc = tiktoken.get_encoding("cl100k_base")
     msgs: List[Dict[str, str]] = [
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": f"Sticky Notes from this user: {sticky}"},
     ]
-    # add rolling history
-    for m in history:
-        msgs.append(m)
-    # final user
+    msgs.extend(history)  # prior user/assistant turns
     msgs.append({"role": "user", "content": user_msg})
-
-    # rough token count; budget ~6k (gpt-4o-mini supports much more, but keep safe)
     budget = 6000
-    def count(ms):
-        return sum(len(enc.encode(m["content"])) + 4 for m in ms) + 2
-
-    while count(msgs) > budget and len(history) > 0:
-        # drop oldest pair from history (after the system+sticky)
-        # remove the third element (index 2) if it's user/assistant alternating
-        for i in range(2, len(msgs)):
-            if msgs[i]["role"] in ("user", "assistant"):
-                del msgs[i]
-                break
-        # also drop from stored history accordingly
-        if SESSIONS:
-            # best-effort shrink: pop from the front
-            if SESSIONS and history:
-                history.pop(0)
+    def count(ms): return sum(len(enc.encode(m["content"])) + 4 for m in ms) + 2
+    while count(msgs) > budget and history:
+        history.pop(0)
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": f"Sticky Notes from this user: {sticky}"},
+            *history,
+            {"role": "user", "content": user_msg},
+        ]
     return msgs
 
-# ===================== LLM call helpers =====================
+# ===================== LLM helpers =====================
 def llm_complete(client: OpenAI, messages: List[Dict[str, str]], stream: bool = False):
-    if stream:
-        return client.chat.completions.create(model=MODEL, messages=messages, stream=True)
-    else:
-        return client.chat.completions.create(model=MODEL, messages=messages, stream=False)
-
-def build_answer_with_sources(text: str, hits: List[Dict[str, Any]]) -> str:
-    if not hits:
-        return text
-    # Append inline citations [S1], [S2] only if user asked; the model is instructed to cite when sources are provided.
-    # We just ensure sources are available; the model will place [S#] where appropriate.
-    return text
+    return client.chat.completions.create(model=MODEL, messages=messages, stream=stream)
 
 # ===================== Health / diag =====================
 @app.get("/")
@@ -290,65 +270,81 @@ def run_chat_once(request: Request, user_message: str, stream: bool = False):
     client = get_client()
     sid = get_or_create_sid(request)
     sess = SESSIONS[sid]
+
+    # record the user turn
     add_history(sid, "user", user_message)
 
-    # 1) Set faith if the user declares it — short ack, no RAG
-    selected_corpus = sess.get("religion")
+    # session faith update, if present
     declared = detect_religion(user_message)
     if declared:
         sess["religion"] = declared
-        selected_corpus = declared
 
-    # 2) Sticky Notes update if any
+    selected_corpus = sess.get("religion")
+    # per-turn override if user asks explicitly for a different scripture family
+    override = detect_corpus_override(user_message)
+    effective_corpus = override or selected_corpus
+
+    # memory add
     remembered_pair = handle_memory_update(sid, user_message)
 
-    # 3) Scripture gating
-    do_rag = wants_scripture(user_message, selected_corpus)
+    # retrieval gating
+    do_rag = wants_scripture(user_message, effective_corpus)
 
     hits: List[Dict[str, Any]] = []
-    if do_rag and selected_corpus in CORPORA:
+    if do_rag and effective_corpus in CORPORA:
         try:
-            hits = retrieve_tfidf(user_message, selected_corpus, k=5)
+            hits = retrieve_tfidf(user_message, effective_corpus, k=5)
         except Exception as e:
             print("RAG error:", e)
 
-    # 4) Build messages with system, sticky, history, and user
+    # build prompt
     sticky = sticky_block(sid)
-    messages = trim_history_for_model(SYSTEM_PROMPT, sticky, sess["history"][:-1], user_message)  # history minus final user we already added above
-    # Re-add the last user message (trim_history built with it, but our stored history might have older state)
-    # Ensure last message is the user's current prompt (already ensured in trim_history)
+    # use stored history EXCEPT the last user we already appended (trim handles it with final user message)
+    history_without_last_user = sess["history"][:-1]
+    messages = trim_history_for_model(SYSTEM_PROMPT, sticky, history_without_last_user, user_message)
 
-    # 5) Call LLM (stream or not)
+    # inject Sources block so the model can actually cite
+    if hits:
+        sources_txt = build_sources_block(hits)
+        if sources_txt:
+            messages.insert(1, {
+                "role": "system",
+                "content": (
+                    "SOURCES (use ONLY these; cite inline as [S1], [S2], ...; "
+                    "if insufficient, say so and ask for a more specific passage):\n\n" + sources_txt
+                ),
+            })
+
     if stream:
         def event_stream():
-            # --- SSE: send initial "connected" ping
             yield ": connected\n\n"
             buffer = ""
-
+            full_text = ""
             try:
                 stream_resp = llm_complete(client, messages, stream=True)
                 for chunk in stream_resp:
                     delta = chunk.choices[0].delta.content or ""
                     if not delta:
                         continue
+                    full_text += delta
                     buffer += delta
-                    if len(buffer) >= STREAM_FLUSH_CHARS or ("\n" in buffer and len(buffer) >= 40):
-                        # flush
-                        for part in re.split(r"(\n)", buffer):
-                            if part == "":
-                                continue
-                            yield f"data: {part}\n\n"
+                    if len(buffer) >= STREAM_FLUSH_CHARS or ("\n" in buffer and len(buffer) >= 48):
+                        # flush by lines to reduce choppiness
+                        parts = re.split(r"(\n)", buffer)
+                        for part in parts:
+                            if part:
+                                yield f"data: {part}\n\n"
                         buffer = ""
-                # flush remaining
                 if buffer:
                     yield f"data: {buffer}\n\n"
-
-                # Close the text stream
                 yield "data: [DONE]\n\n"
 
-                # Sources event ONLY if we actually did retrieval
+                # persist assistant turn AFTER streaming finishes
+                add_history(sid, "assistant", full_text)
+
+                # emit sources metadata only when retrieval happened
                 if do_rag and hits:
-                    payload = {"sources": hits, "selected_corpus": selected_corpus, "remembered": None}
+                    payload = {"sources": hits, "selected_corpus": effective_corpus, "remembered": None}
                     yield "event: sources\n"
                     yield f"data: {json.dumps(payload)}\n\n"
 
@@ -357,7 +353,6 @@ def run_chat_once(request: Request, user_message: str, stream: bool = False):
                 yield f'data: [ERROR] {str(e)}\n\n'
 
         resp = StreamingResponse(event_stream(), media_type="text/event-stream")
-        # ensure cookie
         resp.set_cookie("sid", sid, httponly=True, samesite="lax", path="/")
         return resp
 
@@ -368,13 +363,11 @@ def run_chat_once(request: Request, user_message: str, stream: bool = False):
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
-        # store assistant history
         add_history(sid, "assistant", text)
-
         result = {
             "response": text,
             "sources": hits if do_rag else [],
-            "selected_corpus": selected_corpus,
+            "selected_corpus": effective_corpus,
             "remembered": {"key": remembered_pair[0], "value": remembered_pair[1]} if remembered_pair else None,
         }
         resp = JSONResponse(result)
@@ -394,12 +387,10 @@ async def chat_json(request: Request):
         print("chat_json error:", traceback.format_exc())
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# Back-compat for frontends expecting /chat (JSON)
 @app.post("/chat")
 async def chat_legacy(request: Request):
     return await chat_json(request)
 
-# SSE streaming endpoint
 @app.post("/chat_sse")
 async def chat_sse(request: Request):
     try:
