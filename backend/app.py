@@ -1,413 +1,487 @@
-import os, json, re, uuid, traceback
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+# app.py
+import os
+import re
+import json
+import uuid
+import time
+from typing import Dict, List, Optional, Generator, Any, Tuple
+from dataclasses import dataclass, field
 
-import numpy as np
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from openai import OpenAI
-from sklearn.feature_extraction.text import TfidfVectorizer
-from scipy.sparse import load_npz
-import joblib
-import tiktoken
+from fastapi.middleware.cors import CORSMiddleware
 
-# ===================== OpenAI client =====================
-def get_client():
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    return OpenAI(api_key=key)
+# === OpenAI client (works with openai>=1.0) ===
+try:
+    from openai import OpenAI
+    _HAS_OPENAI = True
+except Exception:
+    _HAS_OPENAI = False
+    OpenAI = None  # type: ignore
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-STREAM_FLUSH_CHARS = 160  # coalesce SSE tokens for smoother output
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # pick any chat model you use
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ===================== CORS / App =====================
-origins = [
-    "https://dturnover.github.io",  # GitHub Pages demo
-    # add more origins if you deploy elsewhere
-]
+# ---------- Simple in-memory session store ----------
+# NOTE: this resets on process restart (Render free dyno etc.). Swap to Redis for durability.
+@dataclass
+class SessionState:
+    faith: Optional[str] = None               # 'bible' | 'quran' | 'sutta_pitaka'
+    facts: Dict[str, str] = field(default_factory=dict)  # "the rose" -> "red"
+    summary: str = ""                         # conversation summary (optional future use)
+    history: List[Dict[str, str]] = field(default_factory=list)  # recent turns for model
+    last_object: Optional[str] = None         # naive "this/that X" anchor
 
+SESSIONS: Dict[str, SessionState] = {}
+
+def get_or_create_sid(request: Request, response: Response) -> Tuple[str, SessionState]:
+    sid = request.cookies.get("sid")
+    if not sid:
+        sid = uuid.uuid4().hex
+        response.set_cookie("sid", sid, httponly=True, samesite="lax", path="/")
+    if sid not in SESSIONS:
+        SESSIONS[sid] = SessionState()
+    return sid, SESSIONS[sid]
+
+# ---------- Tiny RAG (fallback) ----------
+# If you already have an index in your project, feel free to replace the
+# functions below with your existing search utilities. The interface here is:
+#   search_scripture(query, corpus) -> (sources_list, best_snippet)
+RAG_ROOT = os.path.join(os.path.dirname(__file__), "rag_data")
+CORPUS_FILES = {
+    "bible": "bible.jsonl",
+    "quran": "quran.jsonl",
+    "sutta_pitaka": "sutta_pitaka.jsonl",
+}
+
+_LOADED_CORPORA: Dict[str, List[Dict[str, Any]]] = {}
+
+def _load_corpus(corpus: str) -> List[Dict[str, Any]]:
+    if corpus not in CORPUS_FILES:
+        return []
+    if corpus in _LOADED_CORPORA:
+        return _LOADED_CORPORA[corpus]
+    path = os.path.join(RAG_ROOT, CORPUS_FILES[corpus])
+    docs: List[Dict[str, Any]] = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                try:
+                    obj = json.loads(line)
+                    # normalize expected fields
+                    obj.setdefault("text", obj.get("content") or obj.get("body") or "")
+                    obj.setdefault("page", obj.get("page") or obj.get("p") or i)
+                    obj["id"] = obj.get("id") or f"p{obj['page']}_c{i}"
+                    obj["corpus"] = corpus
+                    docs.append(obj)
+                except Exception:
+                    continue
+    _LOADED_CORPORA[corpus] = docs
+    return docs
+
+def diag_rag_counts() -> Dict[str, int]:
+    out = {}
+    for c in CORPUS_FILES:
+        out[c] = len(_load_corpus(c))
+    return out
+
+def _score_hit(q_terms: List[str], text: str) -> int:
+    # super-naive keyword score; good enough for short verse pulls
+    t = text.lower()
+    score = 0
+    for w in q_terms:
+        if not w: continue
+        score += t.count(w)
+    return score
+
+def search_scripture(query: str, corpus: str, k: int = 5) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    docs = _load_corpus(corpus)
+    if not docs:
+        return [], None
+    q = re.sub(r"[^a-z0-9\s]", " ", query.lower())
+    q_terms = [w for w in q.split() if len(w) > 2]
+    scored = []
+    for d in docs:
+        s = _score_hit(q_terms, d.get("text", ""))
+        if s > 0:
+            scored.append((s, d))
+    if not scored:
+        # fallback: just return a generic encouraging line if nothing matched
+        return [], None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [d for _, d in scored[:k]]
+    # pick first as best snippet
+    best = top[0].get("text", "")
+    return top, best
+
+# ---------- Memory helpers ----------
+REMEMBER_PAT = re.compile(
+    r"^\s*(?:remember\s*(?:that|:)?\s*)?(?P<body>.+)$",
+    re.IGNORECASE
+)
+
+IS_PATTERN = re.compile(
+    r"^\s*(?P<key>.+?)\s+(?:is|are|=)\s+(?P<val>.+?)\s*$",
+    re.IGNORECASE
+)
+
+WHAT_COLOR_PAT = re.compile(
+    r"^\s*what\s+(?:color|colour)\s+is\s+(?:the\s+)?(?P<thing>[^?!.]+)\??\s*$",
+    re.IGNORECASE
+)
+
+WHAT_IS_PAT = re.compile(
+    r"^\s*what\s+is\s+(?:the\s+)?(?P<thing>[^?!.]+)\??\s*$",
+    re.IGNORECASE
+)
+
+FAITH_MAP = {
+    "christian": "bible",
+    "christianity": "bible",
+    "muslim": "quran",
+    "islam": "quran",
+    "buddhist": "sutta_pitaka",
+    "buddhism": "sutta_pitaka",
+}
+
+def normalize_key(s: str) -> str:
+    s = s.strip().lower()
+    # drop leading 'the', 'a', 'this', 'that', basic punctuation
+    s = re.sub(r"^(the|a|an|this|that)\s+", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def try_set_faith(message: str, sess: SessionState) -> Optional[str]:
+    m = message.lower()
+    for k, v in FAITH_MAP.items():
+        if re.search(rf"\b{i_escape(k)}\b", m):
+            sess.faith = v
+            return v
+    return None
+
+def i_escape(s: str) -> str:
+    return re.escape(s)
+
+def parse_and_remember(message: str, sess: SessionState) -> Optional[Dict[str, str]]:
+    """
+    Supports:
+      - 'remember that X is Y'
+      - 'remember: my dog tucker died 7 years ago'
+      - 'remember this: the strawberry is black'
+    """
+    text = message.strip()
+    if not re.search(r"\bremember\b", text, re.IGNORECASE):
+        return None
+
+    m = REMEMBER_PAT.match(text)
+    if not m:
+        return None
+
+    body = m.group("body").strip()
+
+    # Try to anchor 'this/that <noun>' to last object if present (very naive)
+    if body.lower().startswith(("this ", "that ")) and sess.last_object:
+        body = body.lower().replace("this", sess.last_object, 1).replace("that", sess.last_object, 1)
+
+    # Try X is Y
+    m2 = IS_PATTERN.match(body)
+    if m2:
+        key = normalize_key(m2.group("key"))
+        val = m2.group("val").strip()
+        if key:
+            sess.facts[key] = val
+            sess.last_object = key
+            return {"key": key, "value": val}
+
+    # Otherwise, store the whole clause, choose a simple key
+    # e.g., 'my dog tucker died 7 years ago' -> key 'my dog tucker', value 'died 7 years ago'
+    parts = re.split(r"\bis\b|=|,|;|—|-", body, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) == 2:
+        key, val = parts[0].strip(), parts[1].strip()
+    else:
+        # fallback: first 4 words = key, rest = value
+        words = body.split()
+        key = " ".join(words[:4])
+        val = " ".join(words[4:]) or body
+    key_n = normalize_key(key)
+    sess.facts[key_n] = val
+    sess.last_object = key_n
+    return {"key": key_n, "value": val}
+
+def lookup_memory_answer(message: str, sess: SessionState) -> Optional[str]:
+    for pat in (WHAT_COLOR_PAT, WHAT_IS_PAT):
+        m = pat.match(message)
+        if m:
+            thing_raw = m.group("thing").strip()
+            thing = normalize_key(thing_raw)
+            # direct
+            if thing in sess.facts:
+                return sess.facts[thing]
+            # try 'the ' prefix or last_object
+            if thing.startswith("the "):
+                k = thing[4:]
+                if k in sess.facts:
+                    return sess.facts[k]
+            # If user says 'this X' and we saved 'X'
+            if thing.startswith("this "):
+                k = thing.replace("this ", "", 1)
+                k = normalize_key(k)
+                if k in sess.facts:
+                    return sess.facts[k]
+    return None
+
+# ---------- Prompt + model ----------
+def build_system_prompt(sess: SessionState) -> str:
+    lines = [
+        "You are 'Fight Chaplain'—a calm, practical corner coach and chaplain.",
+        "Be concise, plain, and supportive. Avoid faux-Elizabethan flourish.",
+        "Use scripture only when asked or when user implies they'd like a verse.",
+        "When scripture is requested, quote verbatim, then add a one-line takeaway.",
+        "If a verse is from a corpus, append a bracket citation like [S1].",
+        "If the user asks about a previously remembered fact, answer directly and briefly.",
+    ]
+    # Faith hint
+    if sess.faith:
+        lines.append(f"User faith: {sess.faith}. Prefer this corpus for verses.")
+
+    # Sticky notes
+    if sess.facts:
+        lines.append("STICKY_NOTES (facts the user told you; treat as true unless contradicted):")
+        for k, v in list(sess.facts.items())[:30]:
+            lines.append(f"- {k} = {v}")
+
+    return "\n".join(lines)
+
+def wants_scripture(message: str) -> bool:
+    m = message.lower()
+    return any(w in m for w in ["verse", "scripture", "bible", "qur", "qur'an", "quran", "sutra", "[s#]"])
+
+def detect_corpus(message: str, sess: SessionState) -> Optional[str]:
+    m = message.lower()
+    if "bible" in m or "christ" in m:
+        return "bible"
+    if "qur" in m or "islam" in m or "muslim" in m:
+        return "quran"
+    if "sutta" in m or "buddh" in m:
+        return "sutta_pitaka"
+    return sess.faith
+
+def call_openai_chat(messages: List[Dict[str, str]], stream: bool = False) -> Generator[str, None, str]:
+    """
+    Returns a generator of text chunks if stream=True, else a one-shot string.
+    """
+    if not _HAS_OPENAI or not OPENAI_API_KEY:
+        # No API → echo fake completion for dev
+        text = "I’m running without OpenAI credentials right now."
+        def _gen():
+            yield text
+        return _gen() if stream else (text)  # type: ignore
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    if stream:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.6,
+            stream=True,
+        )
+        def _gen():
+            for ev in resp:
+                chunk = ev.choices[0].delta.content or ""
+                if chunk:
+                    yield chunk
+        return _gen()
+    else:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.6,
+        )
+        return resp.choices[0].message.content or ""
+
+# ---------- SSE helpers ----------
+def sse_format(event: Optional[str], data: str) -> str:
+    # event can be None for default 'message'
+    if event:
+        return f"event: {event}\n" + "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
+    else:
+        return "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
+
+def smooth_stream(chunks: Generator[str, None, None], flush_chars: int = 80) -> Generator[str, None, None]:
+    """
+    Buffer partial tokens into readable phrases.
+    Flush at sentence boundaries or after ~flush_chars.
+    """
+    buf = ""
+    for piece in chunks:
+        buf += piece
+        # flush on sentence-ish boundary
+        if re.search(r"[\.!\?]\s+$", buf) or len(buf) >= flush_chars:
+            yield buf
+            buf = ""
+    if buf:
+        yield buf
+
+# ---------- FastAPI ----------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # tighten later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===================== Persona =====================
-SYSTEM_PROMPT = """
-You are “Winston Churchill GPT,” a conversational assistant that speaks in the voice and manner of Sir Winston Churchill.
-
-Voice & Style:
-- Formal, eloquent, oratorical; occasionally wry.
-- Uses period-appropriate phrasing and idioms.
-- Concise when answering direct questions; expansive when invited to opine.
-- Avoid modern slang; avoid anachronisms.
-
-Behavior:
-- If a question is unclear, ask a brief clarifying question.
-- If asked about post-1965 events, respond hypothetically from Churchill’s perspective, noting the time limitation.
-- If asked to produce harmful or hateful content, decline firmly but courteously.
-
-Grounding & Sources:
-- When a Sources block is provided, ANSWER USING ONLY THOSE SOURCES. Place inline citations in the text as [S1], [S2], etc., immediately after the supported sentence/phrase. If the Sources are insufficient, say so briefly and ask for a more specific passage.
-- Never claim you “cannot quote” a text if a Sources block includes it.
-
-Stay in character.
-""".strip()
-
-# ===================== Sessions / Memory =====================
-SESSIONS: Dict[str, Dict[str, Any]] = {}  # sid -> {"religion": str|None, "history": [msgs], "sticky": Dict[str,str]}
-MAX_HISTORY_MSGS = 12  # rolling window
-
-def get_or_create_sid(request: Request) -> str:
-    sid = request.cookies.get("sid")
-    if not sid or sid not in SESSIONS:
-        sid = uuid.uuid4().hex
-        SESSIONS[sid] = {"religion": None, "history": [], "sticky": {}}
-    return sid
-
-def add_history(sid: str, role: str, content: str):
-    h = SESSIONS[sid]["history"]
-    h.append({"role": role, "content": content})
-    if len(h) > MAX_HISTORY_MSGS:
-        del h[: len(h) - MAX_HISTORY_MSGS]
-
-# ===================== Faith detection =====================
-RELIGION_MAP = {
-    "bible": "bible", "christian": "bible", "christianity": "bible", "jesus": "bible",
-    "quran": "quran", "koran": "quran", "muslim": "quran", "islam": "quran", "allah": "quran",
-    "buddhist": "sutta_pitaka", "buddhism": "sutta_pitaka", "sutta": "sutta_pitaka",
-    "pitaka": "sutta_pitaka", "pali": "sutta_pitaka", "dhamma": "sutta_pitaka",
-}
-
-def detect_religion(text: str) -> Optional[str]:
-    t = text.lower()
-    for k, corpus in RELIGION_MAP.items():
-        if re.search(rf"\b{k}\b", t):
-            return corpus
-    m = re.search(r"\b(i[' ]?m|i am)\s+(christian|muslim|buddhist|islam|buddhism|christianity)\b", t)
-    if m:
-        return RELIGION_MAP.get(m.group(2), None)
-    return None
-
-# Per-turn override if the user explicitly names a scripture family.
-def detect_corpus_override(text: str) -> Optional[str]:
-    t = (text or "").lower()
-    if re.search(r"\b(qur'?an|koran|ayat|surah|sura)\b", t):
-        return "quran"
-    if re.search(r"\b(bible|psalm|proverb|gospel|epistle|scripture)\b", t):
-        return "bible"
-    if re.search(r"\b(sutta|sutra|pitaka|pali canon|dhamma)\b", t):
-        return "sutta_pitaka"
-    return None
-
-# ===================== RAG load (multi-corpus) =====================
-BASE_DIR = Path(__file__).resolve().parent
-RAG_DIR = BASE_DIR / "rag_data"
-CORPORA: Dict[str, Dict[str, Any]] = {}
-
-def load_all_corpora():
-    CORPORA.clear()
-    if not RAG_DIR.exists():
-        print("RAG dir missing; skip.")
-        return
-    for sub in RAG_DIR.iterdir():
-        if not sub.is_dir():
-            continue
-        name = sub.name
-        try:
-            docs_path = sub / "docs.json"
-            tfidf_vec_path = sub / "tfidf_vectorizer.joblib"
-            tfidf_mat_path = sub / "tfidf_matrix.npz"
-            if not (docs_path.exists() and tfidf_vec_path.exists() and tfidf_mat_path.exists()):
-                continue
-            with open(docs_path, "r", encoding="utf-8") as f:
-                docs = json.load(f)
-            tfidf: TfidfVectorizer = joblib.load(tfidf_vec_path)
-            tfidf_mat = load_npz(tfidf_mat_path)
-            CORPORA[name] = {"docs": docs, "tfidf": tfidf, "tfidf_mat": tfidf_mat}
-            print(f"RAG loaded: {name} -> {len(docs)} chunks, TF-IDF {tfidf_mat.shape}")
-        except Exception as e:
-            print(f"RAG load error for {name}:", e)
-
-load_all_corpora()
-
-def retrieve_tfidf(query: str, corpus: str, k: int = 5) -> List[Dict[str, Any]]:
-    c = CORPORA.get(corpus)
-    if not c:
-        return []
-    tfidf: TfidfVectorizer = c["tfidf"]
-    tfidf_mat = c["tfidf_mat"]
-    docs = c["docs"]
-    qv = tfidf.transform([query])
-    sims = (tfidf_mat @ qv.T).toarray().ravel()
-    top_idx = sims.argsort()[::-1][:k]
-    hits = []
-    for i in top_idx:
-        hits.append({
-            "score": float(sims[i]),
-            "id": docs[i]["id"],
-            "page": docs[i].get("page"),
-            "text": docs[i]["text"],
-            "corpus": corpus,
-        })
-    return hits
-
-def build_sources_block(hits: List[Dict[str, Any]]) -> str:
-    lines = []
-    for i, h in enumerate(hits, start=1):
-        label = f"[S{i}]"
-        page = f"p{h['page']}" if h.get("page") else ""
-        lines.append(f"{label} ({page} {h['id']}) {h['text']}")
-    return "\n\n".join(lines) if lines else ""
-
-# ===================== Scripture gating =====================
-SCRIPTURE_TERMS = re.compile(
-    r"\b(verse|scripture|psalm|proverb|qur'?an|koran|ayat|surah|sutta|sutra|pitaka|cite|citation|reference)\b|\[s\d*\]",
-    re.IGNORECASE,
-)
-
-def wants_scripture(msg: str, selected_corpus: Optional[str]) -> bool:
-    if SCRIPTURE_TERMS.search(msg or ""):
-        return True
-    if selected_corpus:
-        key = {
-            "bible": r"\bfrom the (holy )?bible|from scripture|according to (paul|moses|psalms|proverbs|gospel)\b",
-            "quran": r"\bfrom the qur'?an|from the koran|according to (allah|the prophet)\b",
-            "sutta_pitaka": r"\bfrom (the )?(sutta|sutra|pitaka|pali canon)\b",
-        }.get(selected_corpus, "")
-        if key and re.search(key, msg or "", re.IGNORECASE):
-            return True
-    return False
-
-# ===================== Sticky Notes memory =====================
-REMEMBER_PAT = re.compile(r"\bremember that\s+(.*?)\s+is\s+(.*)", re.IGNORECASE)
-REMEMBER_SIMPLE = re.compile(r"\bremember\s+(.+)", re.IGNORECASE)
-
-def handle_memory_update(sid: str, user_text: str) -> Optional[Tuple[str, str]]:
-    m = REMEMBER_PAT.search(user_text)
-    if m:
-        key = m.group(1).strip().lower()
-        val = m.group(2).strip()
-        SESSIONS[sid]["sticky"][key] = val
-        if len(SESSIONS[sid]["sticky"]) > 6:
-            drop_key = next(iter(SESSIONS[sid]["sticky"].keys()))
-            SESSIONS[sid]["sticky"].pop(drop_key, None)
-        return key, val
-    m2 = REMEMBER_SIMPLE.search(user_text)
-    if m2:
-        text = m2.group(1).strip()
-        if ":" in text:
-            k, v = text.split(":", 1)
-            k, v = k.strip().lower(), v.strip()
-            SESSIONS[sid]["sticky"][k] = v
-            return k, v
-    return None
-
-def sticky_block(sid: str) -> str:
-    mem = SESSIONS[sid]["sticky"]
-    if not mem:
-        return "None"
-    return "; ".join([f"{k} → {v}" for k, v in mem.items()])
-
-# ===================== Token budgeting =====================
-def trim_history_for_model(system_prompt: str, sticky: str, history: List[Dict[str, str]], user_msg: str, model: str = MODEL) -> List[Dict[str, str]]:
-    try:
-        enc = tiktoken.encoding_for_model(model)
-    except Exception:
-        enc = tiktoken.get_encoding("cl100k_base")
-    msgs: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"Sticky Notes from this user: {sticky}"},
-    ]
-    msgs.extend(history)  # prior user/assistant turns
-    msgs.append({"role": "user", "content": user_msg})
-    budget = 6000
-    def count(ms): return sum(len(enc.encode(m["content"])) + 4 for m in ms) + 2
-    while count(msgs) > budget and history:
-        history.pop(0)
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "system", "content": f"Sticky Notes from this user: {sticky}"},
-            *history,
-            {"role": "user", "content": user_msg},
-        ]
-    return msgs
-
-# ===================== LLM helpers =====================
-def llm_complete(client: OpenAI, messages: List[Dict[str, str]], stream: bool = False):
-    return client.chat.completions.create(model=MODEL, messages=messages, stream=stream)
-
-# ===================== Health / diag =====================
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "message": "API is running",
-        "endpoints": ["/chat (JSON)", "/chat_json (JSON)", "/chat_sse (SSE)", "/chat_rag_json (debug)", "/diag", "/diag_rag"]
-    }
-
-@app.get("/diag")
-def diag():
-    try:
-        client = get_client()
-        _ = client.models.list()
-        return {"ok": True}
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
 @app.get("/diag_rag")
 def diag_rag():
-    corpora = {k: (len(v.get("docs") or [])) for k, v in CORPORA.items()}
-    return {"ok": True, "corpora": corpora}
+    return {"ok": True, "corpora": diag_rag_counts()}
 
-# ===================== Core chat logic =====================
-def run_chat_once(request: Request, user_message: str, stream: bool = False):
-    client = get_client()
-    sid = get_or_create_sid(request)
-    sess = SESSIONS[sid]
+@dataclass
+class ChatPayload:
+    message: str
 
-    # record the user turn
-    add_history(sid, "user", user_message)
+def _build_messages(sess: SessionState, user_msg: str) -> List[Dict[str, str]]:
+    sys = {"role": "system", "content": build_system_prompt(sess)}
+    msgs: List[Dict[str, str]] = [sys]
+    # keep last few turns to keep style continuity without blowing context
+    for turn in sess.history[-8:]:
+        msgs.append(turn)
+    msgs.append({"role": "user", "content": user_msg})
+    return msgs
 
-    # session faith update, if present
-    declared = detect_religion(user_message)
-    if declared:
-        sess["religion"] = declared
+def _scripture_flow(message: str, sess: SessionState) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+    corpus = detect_corpus(message, sess) or "bible"
+    sources, best = search_scripture(message, corpus, k=5)
+    if not sources or not best:
+        # fall back to LLM to phrase encouragement
+        messages = _build_messages(sess, f"User asked for a short verse about: {message}. You couldn't find a verse. Offer a one-line encouragement.")
+        text = call_openai_chat(messages, stream=False)  # type: ignore
+        return (text if isinstance(text, str) else "Keep going."), [], corpus
+    # Try to extract a single-sentence "verse-ish" line from best
+    # Naively: take first sentence up to ~180 chars.
+    verse = re.split(r"(?<=[\.!\?])\s+", best.strip())[0]
+    # Ensure it’s not huge
+    if len(verse) > 220:
+        verse = verse[:200].rsplit(" ", 1)[0] + "..."
+    # Add [S1]
+    reply = f"{verse} [S1]"
+    return reply, sources, corpus
 
-    selected_corpus = sess.get("religion")
-    # per-turn override if user asks explicitly for a different scripture family
-    override = detect_corpus_override(user_message)
-    effective_corpus = override or selected_corpus
+def _append_history(sess: SessionState, role: str, content: str):
+    sess.history.append({"role": role, "content": content})
+    # hard cap
+    if len(sess.history) > 24:
+        sess.history = sess.history[-24:]
 
-    # memory add
-    remembered_pair = handle_memory_update(sid, user_message)
-
-    # retrieval gating
-    do_rag = wants_scripture(user_message, effective_corpus)
-
-    hits: List[Dict[str, Any]] = []
-    if do_rag and effective_corpus in CORPORA:
-        try:
-            hits = retrieve_tfidf(user_message, effective_corpus, k=5)
-        except Exception as e:
-            print("RAG error:", e)
-
-    # build prompt
-    sticky = sticky_block(sid)
-    # use stored history EXCEPT the last user we already appended (trim handles it with final user message)
-    history_without_last_user = sess["history"][:-1]
-    messages = trim_history_for_model(SYSTEM_PROMPT, sticky, history_without_last_user, user_message)
-
-    # inject Sources block so the model can actually cite
-    if hits:
-        sources_txt = build_sources_block(hits)
-        if sources_txt:
-            messages.insert(1, {
-                "role": "system",
-                "content": (
-                    "SOURCES (use ONLY these; cite inline as [S1], [S2], ...; "
-                    "if insufficient, say so and ask for a more specific passage):\n\n" + sources_txt
-                ),
-            })
-
-    if stream:
-        def event_stream():
-            yield ": connected\n\n"
-            buffer = ""
-            full_text = ""
-            try:
-                stream_resp = llm_complete(client, messages, stream=True)
-                for chunk in stream_resp:
-                    delta = chunk.choices[0].delta.content or ""
-                    if not delta:
-                        continue
-                    full_text += delta
-                    buffer += delta
-                    if len(buffer) >= STREAM_FLUSH_CHARS or ("\n" in buffer and len(buffer) >= 48):
-                        # flush by lines to reduce choppiness
-                        parts = re.split(r"(\n)", buffer)
-                        for part in parts:
-                            if part:
-                                yield f"data: {part}\n\n"
-                        buffer = ""
-                if buffer:
-                    yield f"data: {buffer}\n\n"
-                yield "data: [DONE]\n\n"
-
-                # persist assistant turn AFTER streaming finishes
-                add_history(sid, "assistant", full_text)
-
-                # emit sources metadata only when retrieval happened
-                if do_rag and hits:
-                    payload = {"sources": hits, "selected_corpus": effective_corpus, "remembered": None}
-                    yield "event: sources\n"
-                    yield f"data: {json.dumps(payload)}\n\n"
-
-            except Exception as e:
-                print("SSE error:", e)
-                yield f'data: [ERROR] {str(e)}\n\n'
-
-        resp = StreamingResponse(event_stream(), media_type="text/event-stream")
-        resp.set_cookie("sid", sid, httponly=True, samesite="lax", path="/")
-        return resp
-
-    else:
-        try:
-            comp = llm_complete(client, messages, stream=False)
-            text = comp.choices[0].message.content
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
-
-        add_history(sid, "assistant", text)
-        result = {
-            "response": text,
-            "sources": hits if do_rag else [],
-            "selected_corpus": effective_corpus,
-            "remembered": {"key": remembered_pair[0], "value": remembered_pair[1]} if remembered_pair else None,
-        }
-        resp = JSONResponse(result)
-        resp.set_cookie("sid", sid, httponly=True, samesite="lax", path="/")
-        return resp
-
-# ===================== Routes =====================
-@app.post("/chat_json")
-async def chat_json(request: Request):
-    try:
-        body = await request.json()
-        msg = (body.get("message") or "").strip()
-        if not msg:
-            return JSONResponse({"error": "message is required"}, status_code=400)
-        return run_chat_once(request, msg, stream=False)
-    except Exception as e:
-        print("chat_json error:", traceback.format_exc())
-        return JSONResponse({"error": str(e)}, status_code=500)
+def _json_response(
+    response_text: str,
+    sources: List[Dict[str, Any]],
+    selected_corpus: Optional[str],
+    remembered: Optional[Dict[str, str]],
+) -> JSONResponse:
+    return JSONResponse({
+        "response": response_text,
+        "sources": sources,
+        "selected_corpus": selected_corpus,
+        "remembered": remembered
+    })
 
 @app.post("/chat")
-async def chat_legacy(request: Request):
-    return await chat_json(request)
+async def chat(request: Request):
+    body = await request.json()
+    message = (body.get("message") or "").strip()
+    resp = Response()
+    sid, sess = get_or_create_sid(request, resp)
+
+    remembered = parse_and_remember(message, sess)
+    faith_now = try_set_faith(message, sess)
+
+    # direct memory Q&A (fast path)
+    mem_ans = lookup_memory_answer(message, sess)
+    if mem_ans:
+        _append_history(sess, "user", message)
+        assistant = mem_ans
+        _append_history(sess, "assistant", assistant)
+        jr = _json_response(assistant, [], None, remembered)
+        # ensure cookie is sent
+        for k, v in resp.headers.items():
+            jr.headers[k] = v
+        return jr
+
+    # scripture?
+    if wants_scripture(message):
+        reply, sources, corpus = _scripture_flow(message, sess)
+        _append_history(sess, "user", message)
+        _append_history(sess, "assistant", reply)
+        jr = _json_response(reply, sources, corpus, remembered)
+        for k, v in resp.headers.items():
+            jr.headers[k] = v
+        return jr
+
+    # normal LLM turn
+    messages = _build_messages(sess, message)
+    out = call_openai_chat(messages, stream=False)
+    reply = out if isinstance(out, str) else "".join(list(out))
+    _append_history(sess, "user", message)
+    _append_history(sess, "assistant", reply)
+    jr = _json_response(reply, [], sess.faith, remembered)
+    for k, v in resp.headers.items():
+        jr.headers[k] = v
+    return jr
 
 @app.post("/chat_sse")
 async def chat_sse(request: Request):
-    try:
-        body = await request.json()
-        msg = (body.get("message") or "").strip()
-        if not msg:
-            return JSONResponse({"error": "message is required"}, status_code=400)
-        return run_chat_once(request, msg, stream=True)
-    except Exception as e:
-        print("chat_sse error:", traceback.format_exc())
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-# Debug: pure RAG JSON (kept for testing)
-@app.post("/chat_rag_json")
-async def chat_rag_json(request: Request):
     body = await request.json()
-    msg = (body.get("message") or "").strip()
-    corpus = body.get("religion") or "bible"
-    hits = retrieve_tfidf(msg, corpus, k=5)
-    return {"response": "", "sources": hits, "selected_corpus": corpus}
+    message = (body.get("message") or "").strip()
+
+    base = Response()
+    sid, sess = get_or_create_sid(request, base)
+    remembered = parse_and_remember(message, sess)
+    try_set_faith(message, sess)
+
+    def gen() -> Generator[str, None, None]:
+        # First line to establish stream
+        yield ": connected\n\n"
+
+        # Memory fast-path?
+        mem_ans = lookup_memory_answer(message, sess)
+        if mem_ans:
+            _append_history(sess, "user", message)
+            _append_history(sess, "assistant", mem_ans)
+            for chunk in re.findall(r'.{1,220}(?:\s+|$)', mem_ans):
+                yield sse_format(None, chunk.strip())
+            # optional meta block
+            meta = json.dumps({"sources": [], "selected_corpus": sess.faith, "remembered": remembered})
+            yield sse_format("sources", meta)
+            return
+
+        # Scripture?
+        if wants_scripture(message):
+            reply, sources, corpus = _scripture_flow(message, sess)
+            _append_history(sess, "user", message)
+            _append_history(sess, "assistant", reply)
+            for chunk in re.findall(r'.{1,220}(?:\s+|$)', reply):
+                yield sse_format(None, chunk.strip())
+            meta = json.dumps({"sources": sources, "selected_corpus": corpus, "remembered": remembered})
+            yield sse_format("sources", meta)
+            return
+
+        # Normal streamed LLM
+        messages = _build_messages(sess, message)
+        stream_chunks = call_openai_chat(messages, stream=True)  # type: ignore
+        for chunk in smooth_stream(stream_chunks):  # type: ignore
+            yield sse_format(None, chunk)
+        _append_history(sess, "user", message)
+        # We didn't buffer the whole reply; fine, history continuity is still ok for next turn.
+
+        # Optional trailing meta
+        meta = json.dumps({"sources": [], "selected_corpus": sess.faith, "remembered": remembered})
+        yield sse_format("sources", meta)
+
+    headers = dict(base.headers)
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+# Friendly root
+@app.get("/")
+def root():
+    return {"ok": True, "msg": "LLM API Demo backend is running"}
