@@ -3,20 +3,18 @@ import os
 import re
 import json
 import uuid
-import hashlib
 from typing import Dict, List, Optional, Any, Iterable, Tuple
 from pathlib import Path
 from dataclasses import dataclass
-from collections import defaultdict, Counter
+from collections import defaultdict
 
-from fastapi import FastAPI, Request, Response, Cookie
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 try:
-    # Optional; only needed if you prefer EventSourceResponse for SSE
-    from sse_starlette.sse import EventSourceResponse
+    from sse_starlette.sse import EventSourceResponse  # optional
     HAS_SSE_STARLETTE = True
 except Exception:
     HAS_SSE_STARLETTE = False
@@ -34,15 +32,19 @@ app = FastAPI()
 
 _FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").strip()
 _ALLOWED_ORIGINS = [o for o in [
-    _ FRONTEND_ORIGIN if (_ORIGIN := _FRONTEND_ORIGIN) else None,  # keeps order
+    _FRONTEND_ORIGIN or None,
     "http://localhost:3000",
     "http://localhost:5173",
 ] if o]
 
+# If you truly need to allow anything (for quick tests), set CORS_ALLOW_ANY=1
+_ALLOW_ANY = os.getenv("CORS_ALLOW_ANY", "0") == "1"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS or [],  # cannot be ["*"] when credentials=True
-    allow_credentials=True,
+    allow_origins=[] if _ALLOW_ANY else _ALLOWED_ORIGINS,          # explicit list
+    allow_origin_regex=".*" if _ALLOW_ANY else None,               # permissive regex only when allowed
+    allow_credentials=True,                                        # cookies!
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -72,7 +74,6 @@ def mem_put(sid: str, key: str, value: str):
 def mem_get(sid: str, text: str) -> Optional[str]:
     t = _norm(text)
     for k, v in MEM.get(sid, {}).items():
-        # direct containment or token overlap gives a hit
         if k in t:
             return v
         ktoks = set(k.split())
@@ -82,20 +83,15 @@ def mem_get(sid: str, text: str) -> Optional[str]:
     return None
 
 def parse_remember(msg: str) -> Optional[Tuple[str, str]]:
-    """Try to extract (key, value) from 'remember ...' messages."""
     m = re.search(r"\bremember(?: that)?\s+(.+)", msg, flags=re.I)
     if not m:
         return None
     tail = m.group(1).strip()
-
-    # Prefer patterns like "X is Y" / "X are Y"
     mi = re.match(r"(.+?)\s+(?:is|are|was|were)\s+(.+)", tail, flags=re.I)
     if mi:
         key = mi.group(1).strip()
         val = mi.group(2).strip().rstrip(".")
         return (key, val)
-
-    # Fallback: if tail looks like "the penguin is painted blue" (already handled), else store entire phrase
     return (tail, "true")
 
 # =========================
@@ -111,21 +107,12 @@ def set_session_cookie(response: Response, request: Request, sid: str):
 
     if cross_site:
         response.set_cookie(
-            key="sid",
-            value=sid,
-            path="/",
-            httponly=True,
-            secure=True,
-            samesite="none",
+            key="sid", value=sid, path="/", httponly=True, secure=True, samesite="none"
         )
     else:
         response.set_cookie(
-            key="sid",
-            value=sid,
-            path="/",
-            httponly=True,
-            secure=(request.url.scheme == "https"),
-            samesite="lax",
+            key="sid", value=sid, path="/", httponly=True,
+            secure=(request.url.scheme == "https"), samesite="lax"
         )
 
 def get_or_create_sid(request: Request, response: Response) -> str:
@@ -168,7 +155,6 @@ def _load_json(p: Path) -> Iterable[Dict[str, Any]]:
         for x in data:
             yield x
     elif isinstance(data, dict):
-        # maybe wrapped
         if "items" in data and isinstance(data["items"], list):
             for x in data["items"]:
                 yield x
@@ -227,9 +213,7 @@ def rag_search(query: str, corpus: str, k: int = 3) -> List[Doc]:
     docs = CORPUS_DOCS.get(corpus, [])
     if not docs:
         return []
-    # crude keyword scoring
     q = query.lower()
-    # strip [S#] tags and filler words
     q = re.sub(r"\[s#\]", " ", q, flags=re.I)
     q = re.sub(r"[^a-z0-9 ]+", " ", q)
     toks = [w for w in q.split() if w not in {"give", "share", "short", "about", "verse", "a", "the", "of", "and"}]
@@ -237,13 +221,12 @@ def rag_search(query: str, corpus: str, k: int = 3) -> List[Doc]:
         toks = query.lower().split()
     scored = [(simple_score(d.text, toks), d) for d in docs]
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [d for s, d in scored[:k] if s > 0] or [docs[0]]
+    top = [d for s, d in scored[:k] if s > 0] or ([docs[0]] if docs else [])
     return top
 
 def build_sources(docs: List[Doc]) -> List[Dict[str, Any]]:
     out = []
     for d in docs[:5]:
-        # keep a small text snippet
         snippet = d.text
         if len(snippet) > 900:
             snippet = snippet[:900] + "..."
@@ -278,7 +261,6 @@ FAITH_MAP = {
 
 def maybe_set_faith(message: str, sid: str) -> Optional[str]:
     m = message.lower().strip()
-    # very light detection: "i am X", "i'm X"
     mi = re.search(r"\b(i am|i'm)\s+(christian|muslim|buddhist)\b", m)
     if mi:
         faith = mi.group(2)
@@ -287,7 +269,6 @@ def maybe_set_faith(message: str, sid: str) -> Optional[str]:
     return None
 
 def format_memory_answer(key: str, value: str) -> str:
-    # attempt a natural sentence if value looks like "painted blue" or "red"
     if re.match(r"^(painted\s+)?[a-z ]+$", value):
         v = value.strip()
         if not v.startswith(("is ", "are ")):
@@ -305,7 +286,6 @@ def answer_json(message: str, selected_corpus: Optional[str], sources: List[Dict
     return JSONResponse(payload)
 
 def make_generic_reply(message: str) -> str:
-    # fallback, simple helpful tone (you can swap to an OpenAI call if desired)
     return "How can I help further?"
 
 # =========================
@@ -317,10 +297,8 @@ async def chat(payload: ChatIn, request: Request):
     sid = get_or_create_sid(request, response)
     msg = payload.message.strip()
 
-    # 1) Faith detection
     new_faith = maybe_set_faith(msg, sid)
 
-    # 2) Memory store
     remembered: Optional[Dict[str, str]] = None
     if re.search(r"\bremember\b", msg, flags=re.I):
         kv = parse_remember(msg)
@@ -329,31 +307,25 @@ async def chat(payload: ChatIn, request: Request):
             mem_put(sid, key, val)
             remembered = {"key": key, "value": val}
 
-    # 3) Memory recall (fast path)
     recalled = mem_get(sid, msg)
     if recalled:
-        # try to guess the subject to make a nice sentence
         subj = None
-        # find something that matches a stored key
         for k in MEM.get(sid, {}):
             if k in _norm(msg):
                 subj = k.strip()
                 break
         text = format_memory_answer(subj or "That", recalled)
         jr = answer_json(msg, None, [], None, text)
-        # transfer our cookies header to JSONResponse
         for k, v in response.headers.items():
             jr.headers[k] = v
         return jr
 
-    # 4) Scripture / RAG
     faith = SESS.get(sid, {}).get("faith")
     sel = detect_corpus(msg, faith)
     if sel:
         docs = rag_search(msg, sel, k=3)
         srcs = build_sources(docs)
-        # Build a short quotation line with [S1]
-        quote = docs[0].text.strip().split("\n")[0]
+        quote = (docs[0].text.strip().split("\n")[0] if docs else "No passage found.")
         if len(quote) > 240:
             quote = quote[:240].rsplit(" ", 1)[0] + "…"
         reply = f"{quote} [S1]"
@@ -362,7 +334,6 @@ async def chat(payload: ChatIn, request: Request):
             jr.headers[k] = v
         return jr
 
-    # 5) Generic
     jr = answer_json(msg, None, [], remembered, make_generic_reply(msg))
     for k, v in response.headers.items():
         jr.headers[k] = v
@@ -372,7 +343,6 @@ async def chat(payload: ChatIn, request: Request):
 # /chat_sse (streaming)
 # =========================
 def stream_tokens(text: str) -> Iterable[str]:
-    # simple word streaming to emulate token flow
     for w in re.split(r"(\s+)", text):
         if not w:
             continue
@@ -387,18 +357,15 @@ def sse_headers() -> Dict[str, str]:
 
 @app.post("/chat_sse")
 async def chat_sse(payload: ChatIn, request: Request):
-    # We still want to set/refresh cookies if a new sid is minted.
     sid_resp = Response()
     sid = get_or_create_sid(request, sid_resp)
     msg = payload.message.strip()
 
-    # prepare response fields
     faith = maybe_set_faith(msg, sid) or SESS.get(sid, {}).get("faith")
     remembered: Optional[Dict[str, str]] = None
     sources: List[Dict[str, Any]] = []
     selected_corpus: Optional[str] = None
 
-    # memory store
     if re.search(r"\bremember\b", msg, flags=re.I):
         kv = parse_remember(msg)
         if kv:
@@ -406,7 +373,6 @@ async def chat_sse(payload: ChatIn, request: Request):
             mem_put(sid, key, val)
             remembered = {"key": key, "value": val}
 
-    # recall
     recalled = mem_get(sid, msg)
     if recalled:
         subj = None
@@ -416,11 +382,42 @@ async def chat_sse(payload: ChatIn, request: Request):
                 break
         full_text = format_memory_answer(subj or "That", recalled)
     else:
-        # RAG?
         selected_corpus = detect_corpus(msg, faith)
         if selected_corpus:
             docs = rag_search(msg, selected_corpus, k=3)
             sources = build_sources(docs)
-            quote = docs[0].text.strip().split("\n")[0]
+            quote = (docs[0].text.strip().split("\n")[0] if docs else "No passage found.")
             if len(quote) > 240:
-                quote
+                quote = quote[:240].rsplit(" ", 1)[0] + "…"
+            full_text = f"{quote} [S1]"
+        else:
+            full_text = make_generic_reply(msg)
+
+    async def gen():
+        yield "data: : connected\n\n"
+        for tok in stream_tokens(full_text):
+            yield f"data: {tok}\n\n"
+        yield "data: [DONE]\n\n"
+        meta = {
+            "sources": sources,
+            "selected_corpus": selected_corpus,
+            "remembered": remembered
+        }
+        yield f"event: sources\ndata: {json.dumps(meta)}\n\n"
+
+    headers = sse_headers()
+    for k, v in sid_resp.headers.items():
+        headers[k] = v
+
+    if HAS_SSE_STARLETTE:
+        return EventSourceResponse(gen(), headers=headers, ping=15000)
+    else:
+        return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+# =========================
+# Dev: run
+# =========================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
