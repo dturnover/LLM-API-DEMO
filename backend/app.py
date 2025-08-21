@@ -1,8 +1,5 @@
 # app.py
-import os
-import re
-import json
-import uuid
+import os, re, json, uuid
 from typing import Dict, List, Optional, Any, Iterable, Tuple
 from pathlib import Path
 from dataclasses import dataclass
@@ -37,14 +34,13 @@ _ALLOWED_ORIGINS = [o for o in [
     "http://localhost:5173",
 ] if o]
 
-# If you truly need to allow anything (for quick tests), set CORS_ALLOW_ANY=1
 _ALLOW_ANY = os.getenv("CORS_ALLOW_ANY", "0") == "1"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[] if _ALLOW_ANY else _ALLOWED_ORIGINS,          # explicit list
-    allow_origin_regex=".*" if _ALLOW_ANY else None,               # permissive regex only when allowed
-    allow_credentials=True,                                        # cookies!
+    allow_origins=[] if _ALLOW_ANY else _ALLOWED_ORIGINS,
+    allow_origin_regex=".*" if _ALLOW_ANY else None,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -53,7 +49,7 @@ app.add_middleware(
 # =========================
 # In-memory state
 # =========================
-SESS: Dict[str, Dict[str, Any]] = {}     # sid -> { "faith": "christian" | "muslim" | "buddhist" }
+SESS: Dict[str, Dict[str, Any]] = {}     # sid -> { "faith": ... }
 MEM: Dict[str, Dict[str, str]] = {}      # sid -> normalized memory {norm(key): value}
 
 # =========================
@@ -68,16 +64,14 @@ def _norm(s: str) -> str:
     return " ".join(s.split())
 
 def mem_put(sid: str, key: str, value: str):
-    d = MEM.setdefault(sid, {})
-    d[_norm(key)] = value
+    MEM.setdefault(sid, {})[_norm(key)] = value
 
 def mem_get(sid: str, text: str) -> Optional[str]:
     t = _norm(text)
     for k, v in MEM.get(sid, {}).items():
         if k in t:
             return v
-        ktoks = set(k.split())
-        ttoks = set(t.split())
+        ktoks = set(k.split()); ttoks = set(t.split())
         if ktoks and (len(ktoks & ttoks) / len(ktoks)) >= 0.6:
             return v
     return None
@@ -89,9 +83,7 @@ def parse_remember(msg: str) -> Optional[Tuple[str, str]]:
     tail = m.group(1).strip()
     mi = re.match(r"(.+?)\s+(?:is|are|was|were)\s+(.+)", tail, flags=re.I)
     if mi:
-        key = mi.group(1).strip()
-        val = mi.group(2).strip().rstrip(".")
-        return (key, val)
+        return (mi.group(1).strip(), mi.group(2).strip().rstrip("."))
     return (tail, "true")
 
 # =========================
@@ -104,16 +96,11 @@ def set_session_cookie(response: Response, request: Request, sid: str):
     origin = (request.headers.get("origin") or "").strip().lower()
     host = f"{request.url.scheme}://{request.url.netloc}".lower()
     cross_site = bool(origin and origin != host)
-
     if cross_site:
-        response.set_cookie(
-            key="sid", value=sid, path="/", httponly=True, secure=True, samesite="none"
-        )
+        response.set_cookie(key="sid", value=sid, path="/", httponly=True, secure=True, samesite="none")
     else:
-        response.set_cookie(
-            key="sid", value=sid, path="/", httponly=True,
-            secure=(request.url.scheme == "https"), samesite="lax"
-        )
+        response.set_cookie(key="sid", value=sid, path="/", httponly=True,
+                            secure=(request.url.scheme == "https"), samesite="lax")
 
 def get_or_create_sid(request: Request, response: Response) -> str:
     sid = request.cookies.get("sid")
@@ -137,27 +124,23 @@ class Doc:
 CORPUS_DOCS: Dict[str, List[Doc]] = defaultdict(list)
 CORPUS_COUNTS: Dict[str, int] = defaultdict(int)
 
-def _load_jsonl(p: Path) -> Iterable[Dict[str, Any]]:
+def _load_jsonl(p: Path):
     with p.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except Exception:
-                continue
+            if line:
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    continue
 
-def _load_json(p: Path) -> Iterable[Dict[str, Any]]:
+def _load_json(p: Path):
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, list):
-        for x in data:
-            yield x
-    elif isinstance(data, dict):
-        if "items" in data and isinstance(data["items"], list):
-            for x in data["items"]:
-                yield x
+        for x in data: yield x
+    elif isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+        for x in data["items"]: yield x
 
 def _ingest_record(rec: Dict[str, Any]):
     text = (rec.get("text") or "").strip()
@@ -172,18 +155,25 @@ def load_corpora():
     base = Path(__file__).parent / "rag_data"
     if not base.exists():
         return
-    for p in base.glob("*.jsonl"):
+    # 1) root-level json/jsonl
+    for p in list(base.glob("*.jsonl")) + list(base.glob("*.json")):
         try:
-            for rec in _load_jsonl(p):
-                _ingest_record(rec)
+            loader = _load_jsonl if p.suffix.lower() == ".jsonl" else _load_json
+            for rec in loader(p): _ingest_record(rec)
         except Exception:
             pass
-    for p in base.glob("*.json"):
-        try:
-            for rec in _load_json(p):
-                _ingest_record(rec)
-        except Exception:
-            pass
+    # 2) per-corpus folders (prep_rag.py writes here)
+    for sub in base.iterdir():
+        if not sub.is_dir():
+            continue
+        dj = sub / "docs.json"
+        if dj.exists():
+            try:
+                for rec in _load_json(dj):
+                    rec.setdefault("corpus", sub.name)
+                    _ingest_record(rec)
+            except Exception:
+                pass
     for k, arr in CORPUS_DOCS.items():
         CORPUS_COUNTS[k] = len(arr)
 
@@ -197,12 +187,9 @@ def detect_corpus(msg: str, faith: Optional[str]) -> Optional[str]:
         return "bible"
     if "sutta" in m or "pitaka" in m or "buddha" in m:
         return "sutta_pitaka"
-    if faith == "christian":
-        return "bible"
-    if faith == "muslim":
-        return "quran"
-    if faith == "buddhist":
-        return "sutta_pitaka"
+    if faith == "christian": return "bible"
+    if faith == "muslim": return "quran"
+    if faith == "buddhist": return "sutta_pitaka"
     return None
 
 def simple_score(text: str, toks: List[str]) -> int:
@@ -216,27 +203,16 @@ def rag_search(query: str, corpus: str, k: int = 3) -> List[Doc]:
     q = query.lower()
     q = re.sub(r"\[s#\]", " ", q, flags=re.I)
     q = re.sub(r"[^a-z0-9 ]+", " ", q)
-    toks = [w for w in q.split() if w not in {"give", "share", "short", "about", "verse", "a", "the", "of", "and"}]
-    if not toks and query.strip():
-        toks = query.lower().split()
+    toks = [w for w in q.split() if w not in {"give","share","short","about","verse","a","the","of","and"}] or q.split()
     scored = [(simple_score(d.text, toks), d) for d in docs]
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [d for s, d in scored[:k] if s > 0] or ([docs[0]] if docs else [])
-    return top
+    return [d for s, d in scored[:k] if s > 0] or (docs[:1])
 
 def build_sources(docs: List[Doc]) -> List[Dict[str, Any]]:
     out = []
     for d in docs[:5]:
-        snippet = d.text
-        if len(snippet) > 900:
-            snippet = snippet[:900] + "..."
-        out.append({
-            "score": 0.0,
-            "id": d.id,
-            "page": d.page,
-            "text": snippet,
-            "corpus": d.corpus
-        })
+        snippet = d.text if len(d.text) <= 900 else d.text[:900] + "..."
+        out.append({"score": 0.0, "id": d.id, "page": d.page, "text": snippet, "corpus": d.corpus})
     return out
 
 # =========================
@@ -244,20 +220,19 @@ def build_sources(docs: List[Doc]) -> List[Dict[str, Any]]:
 # =========================
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "sessions": len(SESS), "corpora": CORPUS_COUNTS}
 
 @app.get("/diag_rag")
-def diag_rag():
+def diag_rag(reload: Optional[int] = 0):
+    if reload:
+        CORPUS_DOCS.clear(); CORPUS_COUNTS.clear()
+        load_corpora()
     return {"ok": True, "corpora": CORPUS_COUNTS}
 
 # =========================
 # Chat Logic
 # =========================
-FAITH_MAP = {
-    "christian": "bible",
-    "muslim": "quran",
-    "buddhist": "sutta_pitaka",
-}
+FAITH_MAP = {"christian":"bible","muslim":"quran","buddhist":"sutta_pitaka"}
 
 def maybe_set_faith(message: str, sid: str) -> Optional[str]:
     m = message.lower().strip()
@@ -277,19 +252,18 @@ def format_memory_answer(key: str, value: str) -> str:
     return f"{key.strip()}: {value}"
 
 def answer_json(message: str, selected_corpus: Optional[str], sources: List[Dict[str, Any]], remembered: Optional[Dict[str, str]], body_text: str) -> JSONResponse:
-    payload = {
+    return JSONResponse({
         "response": body_text,
         "sources": sources or [],
         "selected_corpus": selected_corpus,
         "remembered": remembered,
-    }
-    return JSONResponse(payload)
+    })
 
-def make_generic_reply(message: str) -> str:
+def make_generic_reply(_: str) -> str:
     return "How can I help further?"
 
 # =========================
-# /chat (JSON) endpoint
+# /chat (JSON)
 # =========================
 @app.post("/chat")
 async def chat(payload: ChatIn, request: Request):
@@ -312,12 +286,10 @@ async def chat(payload: ChatIn, request: Request):
         subj = None
         for k in MEM.get(sid, {}):
             if k in _norm(msg):
-                subj = k.strip()
-                break
+                subj = k.strip(); break
         text = format_memory_answer(subj or "That", recalled)
         jr = answer_json(msg, None, [], None, text)
-        for k, v in response.headers.items():
-            jr.headers[k] = v
+        for k, v in response.headers.items(): jr.headers[k] = v
         return jr
 
     faith = SESS.get(sid, {}).get("faith")
@@ -326,17 +298,14 @@ async def chat(payload: ChatIn, request: Request):
         docs = rag_search(msg, sel, k=3)
         srcs = build_sources(docs)
         quote = (docs[0].text.strip().split("\n")[0] if docs else "No passage found.")
-        if len(quote) > 240:
-            quote = quote[:240].rsplit(" ", 1)[0] + "…"
+        if len(quote) > 240: quote = quote[:240].rsplit(" ", 1)[0] + "…"
         reply = f"{quote} [S1]"
         jr = answer_json(msg, sel, srcs, remembered, reply)
-        for k, v in response.headers.items():
-            jr.headers[k] = v
+        for k, v in response.headers.items(): jr.headers[k] = v
         return jr
 
     jr = answer_json(msg, None, [], remembered, make_generic_reply(msg))
-    for k, v in response.headers.items():
-        jr.headers[k] = v
+    for k, v in response.headers.items(): jr.headers[k] = v
     return jr
 
 # =========================
@@ -344,16 +313,7 @@ async def chat(payload: ChatIn, request: Request):
 # =========================
 def stream_tokens(text: str) -> Iterable[str]:
     for w in re.split(r"(\s+)", text):
-        if not w:
-            continue
-        yield w
-
-def sse_headers() -> Dict[str, str]:
-    return {
-        "Cache-Control": "no-cache, no-transform",
-        "X-Accel-Buffering": "no",
-        "Connection": "keep-alive",
-    }
+        if w: yield w
 
 @app.post("/chat_sse")
 async def chat_sse(payload: ChatIn, request: Request):
@@ -378,8 +338,7 @@ async def chat_sse(payload: ChatIn, request: Request):
         subj = None
         for k in MEM.get(sid, {}):
             if k in _norm(msg):
-                subj = k.strip()
-                break
+                subj = k.strip(); break
         full_text = format_memory_answer(subj or "That", recalled)
     else:
         selected_corpus = detect_corpus(msg, faith)
@@ -387,25 +346,26 @@ async def chat_sse(payload: ChatIn, request: Request):
             docs = rag_search(msg, selected_corpus, k=3)
             sources = build_sources(docs)
             quote = (docs[0].text.strip().split("\n")[0] if docs else "No passage found.")
-            if len(quote) > 240:
-                quote = quote[:240].rsplit(" ", 1)[0] + "…"
+            if len(quote) > 240: quote = quote[:240].rsplit(" ", 1)[0] + "…"
             full_text = f"{quote} [S1]"
         else:
             full_text = make_generic_reply(msg)
 
     async def gen():
-        yield "data: : connected\n\n"
+        # Proper SSE comment line to open stream
+        yield ": connected\n\n"
         for tok in stream_tokens(full_text):
             yield f"data: {tok}\n\n"
-        yield "data: [DONE]\n\n"
-        meta = {
-            "sources": sources,
-            "selected_corpus": selected_corpus,
-            "remembered": remembered
-        }
+        # send meta BEFORE done so clients reliably receive it
+        meta = {"sources": sources, "selected_corpus": selected_corpus, "remembered": remembered}
         yield f"event: sources\ndata: {json.dumps(meta)}\n\n"
+        yield "event: done\ndata: {}\n\n"
 
-    headers = sse_headers()
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
     for k, v in sid_resp.headers.items():
         headers[k] = v
 
