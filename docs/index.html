@@ -21,38 +21,83 @@
   </div>
 
   <script>
-    const API_URL = "https://llm-api-demo-5qz1.onrender.com/chat"; // streaming endpoint
+    const API = "https://llm-api-demo-5qz1.onrender.com";  // no trailing slash
 
     const log = document.getElementById('log');
     const msg = document.getElementById('msg');
     const sendBtn = document.getElementById('send');
 
-    function append(t){
-      log.textContent += t;
-      log.scrollTop = log.scrollHeight;
+    function append(t){ log.textContent += t; log.scrollTop = log.scrollHeight; }
+    const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+
+    // Wake Render (handles dynamic-hibernate 503)
+    async function wakeServer(max=6){
+      let delay = 0;
+      for (let i=0;i<max;i++){
+        await sleep(delay);
+        try{
+          const r = await fetch(`${API}/health`, { credentials:'include', mode:'cors' });
+          if (r.ok) return true;
+        }catch(_){}
+        delay = Math.min(8000, i ? 2**i * 500 : 0); // 0,1s,2s,4s,8s,8s
+      }
+      return false;
+    }
+
+    async function sendJSON(message){
+      await wakeServer();
+      const r = await fetch(`${API}/chat`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message })
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      return data; // {response, sources, selected_corpus, remembered}
+    }
+
+    // Optional streaming version (uses POST fetch stream to /chat_sse)
+    async function streamSSE(message){
+      await wakeServer();
+      const r = await fetch(`${API}/chat_sse`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Accept': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ message })
+      });
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      while (true){
+        const {value, done} = await reader.read();
+        if (done) break;
+        const chunk = dec.decode(value, {stream:true});
+        // Append only "data:" token lines
+        for (const line of chunk.split(/\r?\n/)) {
+          if (line.startsWith('data: ')) {
+            const t = line.slice(6);
+            if (t !== '[DONE]') append(t);
+          }
+        }
+      }
+      append("\n");
     }
 
     async function send(){
       const text = msg.value.trim(); if (!text) return;
       msg.value = "";
       append(`You: ${text}\n\nBot: `);
-
       try{
-        const res = await fetch(API_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text })
-        });
-        if(!res.ok || !res.body){ append(`[error ${res.status}]\n\n`); return; }
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        while(true){
-          const { value, done } = await reader.read();
-          if(done) break;
-          append(decoder.decode(value, { stream: true }));
-        }
-        append("\n\n");
+        // Non-streaming JSON (stable, simplest)
+        const data = await sendJSON(text);
+        append(data.response + "\n\n");
+        // If you prefer streaming, swap the two lines:
+        // await streamSSE(text); append("\n");
       }catch(e){
         append(`[network error: ${e.message}]\n\n`);
       }
@@ -65,4 +110,3 @@
   </script>
 </body>
 </html>
-
