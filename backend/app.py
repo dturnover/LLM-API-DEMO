@@ -10,12 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-try:
-    from sse_starlette.sse import EventSourceResponse  # optional
-    HAS_SSE_STARLETTE = True
-except Exception:
-    HAS_SSE_STARLETTE = False
-
 # =========================
 # Models
 # =========================
@@ -40,7 +34,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[] if _ALLOW_ANY else _ALLOWED_ORIGINS,
     allow_origin_regex=".*" if _ALLOW_ANY else None,
-    allow_credentials=True,
+    allow_credentials=True,                         # allow cookies
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -50,10 +44,10 @@ app.add_middleware(
 # In-memory state
 # =========================
 SESS: Dict[str, Dict[str, Any]] = {}     # sid -> { "faith": ... }
-MEM: Dict[str, Dict[str, str]] = {}      # sid -> normalized memory {norm(key): value}
+MEM: Dict[str, Dict[str, str]] = {}      # sid -> normalized memory
 
 # =========================
-# Memory QoL helpers
+# Memory helpers
 # =========================
 _WORDS = re.compile(r"[^a-z0-9 ]+")
 def _norm(s: str) -> str:
@@ -78,12 +72,10 @@ def mem_get(sid: str, text: str) -> Optional[str]:
 
 def parse_remember(msg: str) -> Optional[Tuple[str, str]]:
     m = re.search(r"\bremember(?: that)?\s+(.+)", msg, flags=re.I)
-    if not m:
-        return None
+    if not m: return None
     tail = m.group(1).strip()
     mi = re.match(r"(.+?)\s+(?:is|are|was|were)\s+(.+)", tail, flags=re.I)
-    if mi:
-        return (mi.group(1).strip(), mi.group(2).strip().rstrip("."))
+    if mi: return (mi.group(1).strip(), mi.group(2).strip().rstrip("."))
     return (tail, "true")
 
 # =========================
@@ -96,11 +88,11 @@ def set_session_cookie(response: Response, request: Request, sid: str):
     origin = (request.headers.get("origin") or "").strip().lower()
     host = f"{request.url.scheme}://{request.url.netloc}".lower()
     cross_site = bool(origin and origin != host)
-    if cross_site:
-        response.set_cookie(key="sid", value=sid, path="/", httponly=True, secure=True, samesite="none")
-    else:
-        response.set_cookie(key="sid", value=sid, path="/", httponly=True,
-                            secure=(request.url.scheme == "https"), samesite="lax")
+    response.set_cookie(
+        key="sid", value=sid, path="/", httponly=True,
+        secure=True if cross_site else (request.url.scheme == "https"),
+        samesite="none" if cross_site else "lax",
+    )
 
 def get_or_create_sid(request: Request, response: Response) -> str:
     sid = request.cookies.get("sid")
@@ -112,7 +104,7 @@ def get_or_create_sid(request: Request, response: Response) -> str:
     return sid
 
 # =========================
-# Tiny RAG loader + search
+# Tiny RAG: load + search
 # =========================
 @dataclass
 class Doc:
@@ -128,24 +120,21 @@ def _load_jsonl(p: Path):
     with p.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                try:
-                    yield json.loads(line)
-                except Exception:
-                    continue
+            if not line: continue
+            try: yield json.loads(line)
+            except Exception: continue
 
 def _load_json(p: Path):
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, list):
         for x in data: yield x
-    elif isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+    elif isinstance(data, dict) and isinstance(data.get("items"), list):
         for x in data["items"]: yield x
 
 def _ingest_record(rec: Dict[str, Any]):
     text = (rec.get("text") or "").strip()
-    if not text:
-        return
+    if not text: return
     corpus = (rec.get("corpus") or "").strip().lower() or "misc"
     rid = rec.get("id") or f"{corpus}_{rec.get('page', 0)}"
     page = int(rec.get("page") or 0)
@@ -153,27 +142,23 @@ def _ingest_record(rec: Dict[str, Any]):
 
 def load_corpora():
     base = Path(__file__).parent / "rag_data"
-    if not base.exists():
-        return
-    # 1) root-level json/jsonl
+    if not base.exists(): return
+    # root files
     for p in list(base.glob("*.jsonl")) + list(base.glob("*.json")):
         try:
-            loader = _load_jsonl if p.suffix.lower() == ".jsonl" else _load_json
+            loader = _load_jsonl if p.suffix.lower()==".jsonl" else _load_json
             for rec in loader(p): _ingest_record(rec)
-        except Exception:
-            pass
-    # 2) per-corpus folders (prep_rag.py writes here)
+        except Exception: pass
+    # per-corpus subfolders (prep_rag.py writes here)
     for sub in base.iterdir():
-        if not sub.is_dir():
-            continue
+        if not sub.is_dir(): continue
         dj = sub / "docs.json"
         if dj.exists():
             try:
                 for rec in _load_json(dj):
                     rec.setdefault("corpus", sub.name)
                     _ingest_record(rec)
-            except Exception:
-                pass
+            except Exception: pass
     for k, arr in CORPUS_DOCS.items():
         CORPUS_COUNTS[k] = len(arr)
 
@@ -181,12 +166,9 @@ load_corpora()
 
 def detect_corpus(msg: str, faith: Optional[str]) -> Optional[str]:
     m = msg.lower()
-    if "qur" in m or "koran" in m or "quran" in m:
-        return "quran"
-    if "bible" in m or "psalm" in m or "jesus" in m or "[s#" in m:
-        return "bible"
-    if "sutta" in m or "pitaka" in m or "buddha" in m:
-        return "sutta_pitaka"
+    if "qur" in m or "koran" in m or "quran" in m: return "quran"
+    if "bible" in m or "psalm" in m or "jesus" in m or "[s#" in m: return "bible"
+    if "sutta" in m or "pitaka" in m or "buddha" in m: return "sutta_pitaka"
     if faith == "christian": return "bible"
     if faith == "muslim": return "quran"
     if faith == "buddhist": return "sutta_pitaka"
@@ -198,15 +180,13 @@ def simple_score(text: str, toks: List[str]) -> int:
 
 def rag_search(query: str, corpus: str, k: int = 3) -> List[Doc]:
     docs = CORPUS_DOCS.get(corpus, [])
-    if not docs:
-        return []
-    q = query.lower()
-    q = re.sub(r"\[s#\]", " ", q, flags=re.I)
+    if not docs: return []
+    q = re.sub(r"\[s#\]", " ", query.lower(), flags=re.I)
     q = re.sub(r"[^a-z0-9 ]+", " ", q)
     toks = [w for w in q.split() if w not in {"give","share","short","about","verse","a","the","of","and"}] or q.split()
     scored = [(simple_score(d.text, toks), d) for d in docs]
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [d for s, d in scored[:k] if s > 0] or (docs[:1])
+    return [d for s, d in scored[:k] if s > 0] or docs[:1]
 
 def build_sources(docs: List[Doc]) -> List[Dict[str, Any]]:
     out = []
@@ -232,8 +212,6 @@ def diag_rag(reload: Optional[int] = 0):
 # =========================
 # Chat Logic
 # =========================
-FAITH_MAP = {"christian":"bible","muslim":"quran","buddhist":"sutta_pitaka"}
-
 def maybe_set_faith(message: str, sid: str) -> Optional[str]:
     m = message.lower().strip()
     mi = re.search(r"\b(i am|i'm)\s+(christian|muslim|buddhist)\b", m)
@@ -271,7 +249,7 @@ async def chat(payload: ChatIn, request: Request):
     sid = get_or_create_sid(request, response)
     msg = payload.message.strip()
 
-    new_faith = maybe_set_faith(msg, sid)
+    maybe_set_faith(msg, sid)
 
     remembered: Optional[Dict[str, str]] = None
     if re.search(r"\bremember\b", msg, flags=re.I):
@@ -283,10 +261,7 @@ async def chat(payload: ChatIn, request: Request):
 
     recalled = mem_get(sid, msg)
     if recalled:
-        subj = None
-        for k in MEM.get(sid, {}):
-            if k in _norm(msg):
-                subj = k.strip(); break
+        subj = next((k.strip() for k in MEM.get(sid, {}) if k in _norm(msg)), None)
         text = format_memory_answer(subj or "That", recalled)
         jr = answer_json(msg, None, [], None, text)
         for k, v in response.headers.items(): jr.headers[k] = v
@@ -309,7 +284,7 @@ async def chat(payload: ChatIn, request: Request):
     return jr
 
 # =========================
-# /chat_sse (streaming)
+# /chat_sse (StreamingResponse only)
 # =========================
 def stream_tokens(text: str) -> Iterable[str]:
     for w in re.split(r"(\s+)", text):
@@ -335,10 +310,7 @@ async def chat_sse(payload: ChatIn, request: Request):
 
     recalled = mem_get(sid, msg)
     if recalled:
-        subj = None
-        for k in MEM.get(sid, {}):
-            if k in _norm(msg):
-                subj = k.strip(); break
+        subj = next((k.strip() for k in MEM.get(sid, {}) if k in _norm(msg)), None)
         full_text = format_memory_answer(subj or "That", recalled)
     else:
         selected_corpus = detect_corpus(msg, faith)
@@ -352,13 +324,15 @@ async def chat_sse(payload: ChatIn, request: Request):
             full_text = make_generic_reply(msg)
 
     async def gen():
-        # Proper SSE comment line to open stream
+        # 1) open stream immediately so Content-Length isn't 0
         yield ": connected\n\n"
+        # 2) tokens
         for tok in stream_tokens(full_text):
             yield f"data: {tok}\n\n"
-        # send meta BEFORE done so clients reliably receive it
+        # 3) metadata event
         meta = {"sources": sources, "selected_corpus": selected_corpus, "remembered": remembered}
         yield f"event: sources\ndata: {json.dumps(meta)}\n\n"
+        # 4) done event
         yield "event: done\ndata: {}\n\n"
 
     headers = {
@@ -366,13 +340,8 @@ async def chat_sse(payload: ChatIn, request: Request):
         "X-Accel-Buffering": "no",
         "Connection": "keep-alive",
     }
-    for k, v in sid_resp.headers.items():
-        headers[k] = v
-
-    if HAS_SSE_STARLETTE:
-        return EventSourceResponse(gen(), headers=headers, ping=15000)
-    else:
-        return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+    headers.update(sid_resp.headers)
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
 # =========================
 # Dev: run
