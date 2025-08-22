@@ -30,15 +30,17 @@ _ALLOWED_ORIGINS = [o for o in [
 
 _ALLOW_ANY = os.getenv("CORS_ALLOW_ANY", "0") == "1"
 
+
+# CORS: allow any origin (so GitHub Pages works). Tighten later.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[] if _ALLOW_ANY else _ALLOWED_ORIGINS,
-    allow_origin_regex=".*" if _ALLOW_ANY else None,
-    allow_credentials=True,                         # allow cookies
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origin_regex=".*",   # <-- force echo of the Origin
+    allow_credentials=True,    # cookies work
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
 
 # =========================
 # In-memory state
