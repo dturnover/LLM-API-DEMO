@@ -31,15 +31,24 @@ _ALLOWED_ORIGINS = [o for o in [
 _ALLOW_ANY = os.getenv("CORS_ALLOW_ANY", "0") == "1"
 
 
-# CORS: allow any origin (so GitHub Pages works). Tighten later.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=".*",   # <-- force echo of the Origin
-    allow_credentials=True,    # cookies work
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
+@app.middleware("http")
+async def force_cors(request: Request, call_next):
+    resp: Response = await call_next(request)
+    origin = request.headers.get("origin")
+    if origin:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = (resp.headers.get("Vary", "") + ", Origin").strip(", ")
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Expose-Headers"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return resp
+
+@app.options("/{path:path}")
+def preflight(path: str):
+    # Let the middleware above set the CORS headers
+    return Response(status_code=204)
+
 
 
 # =========================
