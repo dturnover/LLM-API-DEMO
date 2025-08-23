@@ -1,4 +1,3 @@
-# app.py
 import os, re, json, uuid
 from typing import Dict, List, Optional, Any, Iterable, Tuple
 from pathlib import Path
@@ -7,7 +6,7 @@ from collections import defaultdict
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 from pydantic import BaseModel
 
 # ---------- models ----------
@@ -17,17 +16,17 @@ class ChatIn(BaseModel):
 # ---------- app ----------
 app = FastAPI()
 
-# Starlette CORS (kept permissive for now)
+# Permissive CORS (we’ll still force headers below)
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",          # allow GitHub Pages & curl Origin
+    allow_origin_regex=".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
-# Force CORS headers even if something upstream strips them
+# Force CORS headers (so browser never sees “Failed to fetch”)
 @app.middleware("http")
 async def force_cors(request: Request, call_next):
     resp: Response = await call_next(request)
@@ -41,9 +40,14 @@ async def force_cors(request: Request, call_next):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     return resp
 
+# Preflight + HEAD (Render/CF sometimes probe with these)
 @app.options("/{path:path}")
 def preflight(path: str):
-    return Response(status_code=204)
+    return Response(status_code=204, headers={"Cache-Control":"no-store"})
+
+@app.head("/{path:path}")
+def head_ok(path: str):
+    return Response(status_code=200, headers={"Cache-Control":"no-store"})
 
 # ---------- session & memory ----------
 SESS: Dict[str, Dict[str, Any]] = {}
@@ -85,7 +89,7 @@ def mem_get(sid: str, text: str) -> Optional[str]:
     for k, v in MEM.get(sid, {}).items():
         if k in t: return v
         kt, tt = set(k.split()), set(t.split())
-        if kt and (len(kt & tt) / len(kt)) >= 0.6: return v
+        if kt and (len(kt & tt)/len(kt)) >= 0.6: return v
     return None
 
 def parse_remember(msg: str) -> Optional[Tuple[str, str]]:
@@ -110,10 +114,18 @@ CORPUS_COUNTS: Dict[str, int] = defaultdict(int)
 def _load_json(p: Path):
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    if isinstance(data, list): 
+    if isinstance(data, list):
         for x in data: yield x
     elif isinstance(data, dict) and isinstance(data.get("items"), list):
         for x in data["items"]: yield x
+
+def _load_jsonl(p: Path):
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line=line.strip()
+            if not line: continue
+            try: yield json.loads(line)
+            except: pass
 
 def _ingest_record(rec: Dict[str, Any]):
     text = (rec.get("text") or "").strip()
@@ -126,13 +138,13 @@ def _ingest_record(rec: Dict[str, Any]):
 def load_corpora():
     base = Path(__file__).parent / "rag_data"
     if not base.exists(): return
-    # root json/jsonl
+    # root files
     for p in list(base.glob("*.json")) + list(base.glob("*.jsonl")):
         try:
-            loader = _load_json if p.suffix == ".json" else (lambda x: (json.loads(l) for l in x.open("r", encoding="utf-8")))
-            for rec in (loader(p) if p.suffix == ".json" else loader(p)): _ingest_record(rec)
-        except Exception: pass
-    # per-corpus subfolders
+            loader = _load_json if p.suffix==".json" else _load_jsonl
+            for rec in loader(p): _ingest_record(rec)
+        except: pass
+    # per-corpus subfolders (output of prep_rag.py)
     for sub in base.iterdir():
         if not sub.is_dir(): continue
         dj = sub / "docs.json"
@@ -141,7 +153,7 @@ def load_corpora():
                 for rec in _load_json(dj):
                     rec.setdefault("corpus", sub.name)
                     _ingest_record(rec)
-            except Exception: pass
+            except: pass
     for k, arr in CORPUS_DOCS.items():
         CORPUS_COUNTS[k] = len(arr)
 
@@ -179,9 +191,14 @@ def build_sources(docs: List[Doc]) -> List[Dict[str, Any]]:
     return out
 
 # ---------- health ----------
+@app.get("/")
+def root():
+    return PlainTextResponse("ok", headers={"Cache-Control":"no-store"})
+
 @app.get("/health")
 def health():
-    return {"ok": True, "sessions": len(SESS), "corpora": CORPUS_COUNTS}
+    return JSONResponse({"ok": True, "sessions": len(SESS), "corpora": CORPUS_COUNTS},
+                        headers={"Cache-Control":"no-store"})
 
 @app.get("/diag_rag")
 def diag_rag(reload: Optional[int] = 0):
@@ -207,8 +224,10 @@ def format_memory_answer(key: str, value: str) -> str:
         return f"{key.strip()} {v}."
     return f"{key.strip()}: {value}"
 
-def answer_json(selected_corpus: Optional[str], sources: List[Dict[str, Any]], remembered: Optional[Dict[str, str]], body_text: str) -> JSONResponse:
-    return JSONResponse({"response": body_text, "sources": sources or [], "selected_corpus": selected_corpus, "remembered": remembered})
+def answer_json(selected_corpus: Optional[str], sources: List[Dict[str, Any]],
+                remembered: Optional[Dict[str, str]], body_text: str) -> JSONResponse:
+    return JSONResponse({"response": body_text, "sources": sources or [],
+                         "selected_corpus": selected_corpus, "remembered": remembered})
 
 def make_generic_reply(_: str) -> str:
     return "How can I help further?"
@@ -252,7 +271,7 @@ async def chat(payload: ChatIn, request: Request):
     for k, v in response.headers.items(): jr.headers[k] = v
     return jr
 
-# ---------- streaming (GET; reliable behind Cloudflare) ----------
+# ---------- streaming (GET; Cloudflare-safe) ----------
 def stream_tokens(text: str) -> Iterable[str]:
     for w in re.split(r"(\s+)", text):
         if w: yield w
@@ -290,7 +309,7 @@ async def chat_sse_get(request: Request, q: str):
         yield f"event: sources\ndata: {json.dumps({'sources': sources, 'selected_corpus': selected_corpus, 'remembered': remembered})}\n\n"
         yield "event: done\ndata: {}\n\n"
 
-    headers = {"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
+    headers = {"Cache-Control":"no-cache, no-transform", "X-Accel-Buffering":"no", "Connection":"keep-alive"}
     headers.update(sid_resp.headers)
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
