@@ -20,6 +20,7 @@
       <div class="tiny"><label><input type="checkbox" id="useSSE" checked> stream</label></div>
     </div>
   </div>
+
 <script>
 const API="https://llm-api-demo-5qz1.onrender.com";
 const log=document.getElementById('log'), msg=document.getElementById('msg'), btn=document.getElementById('send'), useSSE=document.getElementById('useSSE');
@@ -27,29 +28,40 @@ function append(t){ log.textContent+=t; log.scrollTop=log.scrollHeight; }
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function wake(){ for(let i=0;i<40;i++){ try{const r=await fetch(API+'/',{credentials:'include'}); if(r.ok) return}catch{} await sleep(3000)} }
 
-async function postJSON(text){
-  const r=await fetch(API+'/chat',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
-  if(!r.ok) throw new Error('HTTP '+r.status);
-  return r.json();
-}
 function streamGET(text){
-  const es=new EventSource(API+'/chat_sse_get?q='+encodeURIComponent(text),{withCredentials:true});
-  es.onopen=()=>append(': connected\n');
-  es.onmessage=e=>append(e.data);
-  es.addEventListener('sources', e=>append('\n\n[sources attached]\n'));
-  es.addEventListener('done', ()=>es.close());
-  es.onerror=()=>es.close();
+  const url = API + '/chat_sse_get?q=' + encodeURIComponent(text);
+  const es = new EventSource(url, { withCredentials: true });
+  es.onopen = () => append(': connected\n');
+  es.onmessage = (e) => append(e.data);
+  es.addEventListener('sources', (e) => append('\n\n[sources attached]\n'));
+  es.addEventListener('done', () => es.close());
+  es.onerror = () => {
+    append(`\n[stream error] readyState=${es.readyState}\n`);
+    es.close();
+  };
+}
+
+async function postJSON(text){
+  const r=await fetch(API+'/chat',{
+    method:'POST', credentials:'include',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message:text})
+  });
+  if(!r.ok){ throw new Error('HTTP '+r.status); }
+  return r.json();
 }
 
 async function send(){
-  const text=msg.value.trim(); if(!text) return; msg.value=""; append(`You: ${text}\n\nBot: `);
+  const text=msg.value.trim(); if(!text) return;
+  msg.value=""; append(`You: ${text}\n\nBot: `);
   await wake();
   try{
     if(useSSE.checked){ streamGET(text); append('\n'); }
     else{ const data=await postJSON(text); append(data.response+"\n\n"); }
   }catch(e){ append(`[network error: ${e.message}]\n\n`); }
 }
-btn.onclick=send; msg.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); }});
+btn.onclick=send;
+msg.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); }});
 </script>
 </body>
 </html>
