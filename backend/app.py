@@ -1,359 +1,360 @@
-# app.py — FastAPI + cookie sessions + memory + tiny RAG + OpenAI + SSE
+# app.py
 import os, re, json, uuid
-from typing import Dict, List, Optional, Any, Iterable
-from pathlib import Path
-from dataclasses import dataclass, field
-from collections import defaultdict
+from typing import Dict, List, Optional, Any, Tuple, Generator
 
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
-from pydantic import BaseModel
 
-# ---------- OpenAI ----------
-from openai import OpenAI
+# ---- OpenAI (>=1.0) ----
+try:
+    from openai import OpenAI
+    _HAS_OPENAI = True
+except Exception:
+    _HAS_OPENAI = False
+    OpenAI = None  # type: ignore
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-client = OpenAI() if OPENAI_API_KEY else None
 
-# ---------- FastAPI + CORS ----------
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=".*",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
+# ========= Session state (in-memory) =========
+class SessionState:
+    def __init__(self) -> None:
+        self.faith: Optional[str] = None        # "bible" | "quran" | "sutta_pitaka"
+        self.facts: Dict[str, str] = {}         # remembered facts
+        self.history: List[Dict[str, str]] = [] # short rolling window
 
-@app.middleware("http")
-async def echo_origin(request: Request, call_next):
-    resp: Response = await call_next(request)
-    origin = request.headers.get("origin")
-    if origin:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = (resp.headers.get("Vary", "") + ", Origin").strip(", ")
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Expose-Headers"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    return resp
+SESSIONS: Dict[str, SessionState] = {}
 
-@app.options("/{path:path}")
-def preflight(path: str):  # CORS preflight
-    return Response(status_code=204)
-
-# ---------- Sessions & memory ----------
-@dataclass
-class Session:
-    faith: Optional[str] = None            # "bible" | "quran" | "sutta_pitaka"
-    facts: Dict[str, str] = field(default_factory=dict)  # normalized key -> value
-SESS: Dict[str, Session] = {}
-
-_WORDS = re.compile(r"[^a-z0-9 ]+")
-def _norm(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = " " + _WORDS.sub(" ", s) + " "
-    for w in (" the ", " a ", " an ", " my ", " your "):
-        s = s.replace(w, " ")
-    return " ".join(s.split())
-
-def get_or_create_sid(request: Request, response: Response) -> str:
+def get_or_create_sid(request: Request, response: Response) -> Tuple[str, SessionState]:
     sid = request.cookies.get("sid")
     if not sid:
         sid = uuid.uuid4().hex
-        origin = (request.headers.get("origin") or "").strip().lower()
-        host = f"{request.url.scheme}://{request.url.netloc}".lower()
-        cross_site = bool(origin and origin != host)
+        # cross-site cookie (Pages -> Render)
         response.set_cookie(
-            "sid", sid, path="/", httponly=True,
-            secure=True if cross_site else (request.url.scheme == "https"),
-            samesite="none" if cross_site else "lax"
+            "sid", sid, httponly=True, samesite="none", secure=True, path="/"
         )
-    if sid not in SESS:
-        SESS[sid] = Session()
-    return sid
+    if sid not in SESSIONS:
+        SESSIONS[sid] = SessionState()
+    return sid, SESSIONS[sid]
 
-def parse_remember(msg: str) -> Optional[Dict[str, str]]:
-    if not re.search(r"\bremember\b", msg, re.I):
-        return None
-    m = re.search(r"remember(?:\s+that)?\s+(?P<key>.+?)\s+(?:is|are|=)\s+(?P<val>.+)", msg, re.I)
+# ========= RAG (very small + fast) =========
+from pathlib import Path
+RAG_ROOT = Path(__file__).parent / "rag_data"
+CORPUS_FILES = {"bible":"bible.jsonl", "quran":"quran.jsonl", "sutta_pitaka":"sutta_pitaka.jsonl"}
+_LOADED: Dict[str, List[Dict[str, Any]]] = {}
+
+def _load_corpus(corpus: str) -> List[Dict[str, Any]]:
+    if corpus not in CORPUS_FILES: return []
+    if corpus in _LOADED: return _LOADED[corpus]
+    p = RAG_ROOT / CORPUS_FILES[corpus]
+    docs: List[Dict[str, Any]] = []
+    if p.exists():
+        with p.open("r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                try:
+                    obj = json.loads(line)
+                    obj.setdefault("text", obj.get("text") or obj.get("content") or "")
+                    obj.setdefault("page", obj.get("page") or i)
+                    obj["id"] = obj.get("id") or f"p{obj['page']}_c{i}"
+                    obj["corpus"] = corpus
+                    docs.append(obj)
+                except Exception:
+                    continue
+    _LOADED[corpus] = docs
+    return docs
+
+def diag_rag_counts() -> Dict[str,int]:
+    return {c: len(_load_corpus(c)) for c in CORPUS_FILES}
+
+def search_scripture(query: str, corpus: str, k: int = 3) -> Tuple[List[Dict[str,Any]], Optional[str]]:
+    docs = _load_corpus(corpus)
+    if not docs: return [], None
+    terms = [w for w in re.sub(r"[^a-z0-9\s]", " ", query.lower()).split() if len(w)>2]
+    scored = []
+    for d in docs:
+        t = d.get("text","").lower()
+        score = sum(t.count(w) for w in terms)
+        if score>0: scored.append((score,d))
+    if not scored: return [], None
+    scored.sort(key=lambda x:x[0], reverse=True)
+    tops = [d for _,d in scored[:k]]
+    best = tops[0].get("text","")
+    # return first sentence-ish as a "verse-ish" pull, capped
+    verse = re.split(r"(?<=[.!?])\s+", best.strip())[0]
+    if len(verse)>220:
+        verse = verse[:200].rsplit(" ",1)[0]+"..."
+    return tops, f"{verse} [S1]"
+
+# ========= Heuristics =========
+FAITH_MAP = {
+    "christian": "bible", "christianity":"bible", "bible":"bible",
+    "muslim":"quran", "islam":"quran", "qur":"quran", "quran":"quran",
+    "buddhist":"sutta_pitaka", "buddhism":"sutta_pitaka", "sutta":"sutta_pitaka",
+}
+def try_set_faith(message: str, s: SessionState) -> None:
+    m = message.lower()
+    for k,v in FAITH_MAP.items():
+        if re.search(rf"\b{re.escape(k)}\b", m): s.faith=v; return
+
+REMEMBER_RE = re.compile(r"\bremember\b", re.I)
+IS_RE       = re.compile(r"^\s*(?P<k>.+?)\s+(?:is|are|=)\s+(?P<v>.+?)\s*$", re.I)
+def normalize_key(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"^(the|a|an|this|that)\s+", "", s)
+    return re.sub(r"\s+"," ", s)
+
+def parse_and_remember(message: str, s: SessionState) -> Optional[Dict[str,str]]:
+    if not REMEMBER_RE.search(message): return None
+    body = re.sub(r"^\s*remember\s*(that|:)?\s*", "", message, flags=re.I).strip()
+    m = IS_RE.match(body)
     if m:
-        return {"key": _norm(m.group("key")), "value": m.group("val").strip().rstrip(".")}
-    body = re.sub(r"^\s*remember(?::|\s+that)?\s*", "", msg, flags=re.I).strip()
+        k = normalize_key(m.group("k")); v = m.group("v").strip()
+        if k: s.facts[k]=v; return {"key":k,"value":v}
+    # fallback: first 4 words = key
     words = body.split()
-    key = _norm(" ".join(words[:4])) or "note"
-    val = " ".join(words[4:]) or body
-    return {"key": key, "value": val}
+    k = normalize_key(" ".join(words[:4])) or "note"
+    v = " ".join(words[4:]) or body
+    s.facts[k]=v
+    return {"key":k,"value":v}
 
-def memory_put(sess: Session, kv: Dict[str, str]):
-    sess.facts[kv["key"]] = kv["value"]
+Q_COLOR = re.compile(r"^\s*what\s+(color|colour)\s+is\s+(?:the\s+)?(?P<x>[^?!.]+)\??\s*$", re.I)
+Q_WHAT  = re.compile(r"^\s*what\s+is\s+(?:the\s+)?(?P<x>[^?!.]+)\??\s*$", re.I)
+def lookup_memory_answer(message: str, s: SessionState) -> Optional[str]:
+    m = Q_COLOR.match(message) or Q_WHAT.match(message)
+    if not m: return None
+    x = normalize_key(m.group("x"))
+    return s.facts.get(x) or s.facts.get(x.replace("the ","",1), None)
 
-def memory_get(sess: Session, msg: str) -> Optional[str]:
-    t = _norm(msg)
-    for k, v in sess.facts.items():
-        if k in t:
-            return v
-        kt, tt = set(k.split()), set(t.split())
-        if kt and (len(kt & tt) / len(kt)) >= 0.6:
-            return v
-    return None
+def wants_scripture(message: str) -> bool:
+    m = message.lower()
+    return any(w in m for w in ["verse","scripture","[s#]"])
 
-FAITH_MAP = {"christian": "bible", "muslim": "quran", "buddhist": "sutta_pitaka"}
-def maybe_set_faith(msg: str, sess: Session):
-    m = re.search(r"\b(i am|i'm)\s+(christian|muslim|buddhist)\b", msg.lower())
-    if m:
-        sess.faith = FAITH_MAP[m.group(2)]
+def is_emotional(message: str) -> bool:
+    m = message.lower()
+    hot = ["scared","afraid","anxious","nervous","panic","breakup","hurt","down",
+           "lost","depressed","angry","frustrated","worried","fight","injury","pain"]
+    return any(w in m for w in hot)
 
-# ---------- Tiny RAG ----------
-@dataclass
-class Doc:
-    id: str; page: int; text: str; corpus: str
+def detect_corpus(message: str, s: SessionState) -> str:
+    m = message.lower()
+    if "bible" in m or "christ" in m: return "bible"
+    if "qur" in m or "islam" in m or "muslim" in m: return "quran"
+    if "sutta" in m or "buddh" in m: return "sutta_pitaka"
+    return s.faith or "bible"
 
-CORPUS: Dict[str, List[Doc]] = defaultdict(list)
-COUNTS: Dict[str, int] = defaultdict(int)
+def build_system_prompt(s: SessionState) -> str:
+    lines = [
+        "You are Fight Chaplain: calm, concise, and encouraging.",
+        "Offer practical corner-coach guidance with spiritual grounding.",
+        "When a verse is appropriate, quote plainly and append a bracket citation like [S1].",
+        "Keep answers tight; avoid flowery language.",
+    ]
+    if s.faith: lines.append(f"User faith: {s.faith}. Prefer that corpus.")
+    if s.facts:
+        lines.append("STICKY_NOTES:")
+        for k,v in list(s.facts.items())[:30]:
+            lines.append(f"- {k} = {v}")
+    return "\n".join(lines)
 
-def _ingest(r: Dict[str, Any]):
-    t = (r.get("text") or "").strip()
-    if not t: return
-    c = (r.get("corpus") or "misc").lower()
-    d = Doc(
-        id=str(r.get("id") or f"{c}_{r.get('page', 0)}"),
-        page=int(r.get("page") or 0),
-        text=t,
-        corpus=c,
-    )
-    CORPUS[c].append(d)
+def _build_messages(s: SessionState, user: str) -> List[Dict[str,str]]:
+    msgs = [{"role":"system","content":build_system_prompt(s)}]
+    msgs += s.history[-8:]
+    msgs.append({"role":"user","content":user})
+    return msgs
 
-def load_rag():
-    root = Path(__file__).parent / "rag_data"
-    if not root.exists(): return
-    for p in list(root.glob("*.jsonl")) + list(root.glob("*.json")):
-        try:
-            if p.suffix == ".jsonl":
-                for ln in p.read_text(encoding="utf-8").splitlines():
-                    if not ln.strip(): continue
-                    _ingest(json.loads(ln))
-            else:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                for r in (data if isinstance(data, list) else data.get("items", [])):
-                    _ingest(r)
-        except:
-            pass
-    for sub in root.iterdir():
-        if not sub.is_dir(): continue
-        dj = sub / "docs.json"
-        if dj.exists():
-            try:
-                data = json.loads(dj.read_text(encoding="utf-8"))
-                for r in data:
-                    r.setdefault("corpus", sub.name)
-                    _ingest(r)
-            except:
-                pass
-    for k, arr in CORPUS.items():
-        COUNTS[k] = len(arr)
-load_rag()
+# ========= OpenAI call =========
+def call_openai(messages: List[Dict[str,str]], stream: bool) -> Generator[str,None,str] | str:
+    if not (_HAS_OPENAI and OPENAI_API_KEY):
+        txt = "⚠️ OpenAI disabled on server; running in dev mode."
+        if stream:
+            def _g():  # type: ignore
+                yield txt
+            return _g()
+        return txt
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    if stream:
+        resp = client.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.5, stream=True)
+        def _gen():  # type: ignore
+            for ev in resp:
+                chunk = ev.choices[0].delta.content or ""
+                if chunk: yield chunk
+        return _gen()
+    else:
+        resp = client.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.5)
+        return resp.choices[0].message.content or ""
 
-def rag_query(q: str, corpus: str, k: int = 3) -> List[Doc]:
-    docs = CORPUS.get(corpus, [])
-    if not docs: return []
-    q = re.sub(r"\[s#\]", " ", q.lower())
-    q = re.sub(r"[^a-z0-9 ]+", " ", q)
-    toks = [w for w in q.split() if w not in {"give","share","short","about","verse","a","the","of","and"}] or q.split()
-    def score(text: str) -> int:
-        t = text.lower()
-        return sum(t.count(tok) for tok in toks if tok)
-    ranked = sorted(((score(d.text), d) for d in docs), key=lambda x: x[0], reverse=True)
-    return [d for s, d in ranked[:k] if s > 0] or (docs[:1] if docs else [])
-
-def sources_payload(docs: List[Doc]) -> List[Dict[str, Any]]:
-    out = []
-    for d in docs[:5]:
-        snippet = d.text if len(d.text) <= 900 else d.text[:900] + "..."
-        out.append({"id": d.id, "page": d.page, "text": snippet, "corpus": d.corpus, "score": 0.0})
-    return out
-
-def detect_corpus(msg: str, sess: Session) -> Optional[str]:
-    m = msg.lower()
-    if "qur" in m or "koran" in m or "quran" in m: return "quran"
-    if "bible" in m or "psalm" in m or "jesus" in m or "[s#" in m: return "bible"
-    if "sutta" in m or "pitaka" in m or "buddha" in m: return "sutta_pitaka"
-    return sess.faith
-
-# ---------- Proactive scripture logic ----------
-EMO = {
-    "scared","afraid","nervous","anxious","anxiety","worry","worried","stress","stressed",
-    "tired","hurt","injured","pain","sad","grief","loss","breakup","fear","doubt","weak",
-    "overwhelmed","panic","angry","frustrated","discouraged","hopeless","lonely","shame","guilt"
+# ========= App + CORS =========
+ALLOWED_ORIGINS = {
+    "https://dturnover.github.io",
+    # add locals if needed:
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:5500", "http://127.0.0.1:5500",
 }
-SPIRIT = {
-    "courage","perseverance","patience","hope","faith","forgiveness","gratitude",
-    "strength","endurance","redemption","mercy","peace","calm","trust"
-}
-ROUTINE = {"pre-fight","before fight","before sparring","sparring","fight","weigh-in","routine","warmup","warm-up","breathe","breathing"}
 
-def should_use_scripture(msg: str, sess: Session) -> Optional[str]:
-    if not sess.faith: return None
-    m = msg.lower()
-    if detect_corpus(msg, sess): return detect_corpus(msg, sess)
-    if any(w in m for w in EMO) or any(w in m for w in SPIRIT) or any(w in m for w in ROUTINE):
-        return sess.faith
-    return None
+app = FastAPI()
+# Base CORS (we still echo origin below so cookies work)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(ALLOWED_ORIGINS),
+    allow_credentials=True,
+    allow_methods=["GET","POST","OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
+)
 
-def pick_short_verse_text(docs: List[Doc]) -> str:
-    if not docs: return "No passage found."
-    first = docs[0].text.strip()
-    line = first.split("\n")[0].strip()
-    if len(line) > 240: line = line[:240].rsplit(" ", 1)[0] + "…"
-    return line
+# Echo Origin (some proxies strip framework CORS; this forces the header)
+@app.middleware("http")
+async def echo_origin_header(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+    resp: Response = await call_next(request)
+    if origin in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin, Accept-Encoding"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        resp.headers["Access-Control-Expose-Headers"] = "*"
+    return resp
 
-def one_line_reflection(user_msg: str, verse_text: str) -> str:
-    if not client:
-        return "Breathe. You’re not alone; choose your pace and fight with clarity."
-    r = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role":"system","content":"In ONE sentence (<=24 words), apply the verse to the user's situation with a calm mentor voice. No quotes, no citations."},
-            {"role":"user","content": f"User: {user_msg}\nVerse: {verse_text}"},
-        ],
-        temperature=0.6,
-    )
-    return (r.choices[0].message.content or "").strip() or "Hold steady—courage grows with each faithful breath."
+# ========= Utilities =========
+def sse_event(event: Optional[str], data: str) -> str:
+    if event:
+        return f"event: {event}\n" + "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
+    return "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
 
-def scripture_reply(user_msg: str, corpus: str) -> Dict[str, Any]:
-    docs = rag_query(user_msg, corpus, k=3)
-    srcs = sources_payload(docs)
-    verse = pick_short_verse_text(docs)
-    refl  = one_line_reflection(user_msg, verse)
-    return {"text": f"{verse} [S1]\n➝ {refl}", "sources": srcs, "corpus": corpus}
-
-# ---------- Prompts ----------
-def system_prompt(sess: Session) -> str:
-    notes = "\n".join(f"- {k}: {v}" for k, v in list(sess.facts.items())[:30]) or "- (none)"
-    faith = sess.faith or "(not set)"
-    return (
-        "You are Fight Chaplain: a calm, modern, practical pastoral coach for combat athletes. "
-        "Be brief. Encourage safety and agency. If scripture not provided, stay secular.\n"
-        f"Faith: {faith}\nKnown facts:\n{notes}"
-    )
-
-# ---------- Models ----------
-class ChatIn(BaseModel):
-    message: str
-
-# ---------- Health ----------
+# ========= Routes =========
 @app.get("/")
 def root():
     return PlainTextResponse("ok")
 
 @app.get("/health")
 def health():
-    return JSONResponse({"ok": True, "sessions": len(SESS), "corpora": COUNTS})
+    return PlainTextResponse("OK")
 
-# ---------- /chat (JSON primary) ----------
+@app.get("/diag_rag")
+def diag():
+    return {"ok": True, "corpora": diag_rag_counts()}
+
+def _json_response(resp_text: str, sources: List[Dict[str,Any]], corpus: Optional[str], remembered: Optional[Dict[str,str]], base: Response) -> JSONResponse:
+    jr = JSONResponse({"response": resp_text, "sources": sources, "selected_corpus": corpus, "remembered": remembered})
+    # forward cookie header from get_or_create_sid response
+    for k, v in base.headers.items():
+        jr.headers[k] = v
+    return jr
+
 @app.post("/chat")
-async def chat(payload: ChatIn, request: Request, response: Response):
-    sid = get_or_create_sid(request, response); sess = SESS[sid]
-    msg = (payload.message or "").strip()
-    maybe_set_faith(msg, sess)
+async def chat(request: Request):
+    body = await request.json()
+    message = (body.get("message") or "").strip()
 
-    # write memory (ack immediately)
-    remembered = parse_remember(msg)
-    if remembered:
-        memory_put(sess, remembered)
-        return {"response": f"Noted: {remembered['key']} = {remembered['value']}.", "sources": [], "selected_corpus": None, "remembered": remembered}
+    base = Response()
+    _sid, s = get_or_create_sid(request, base)
+    remembered = parse_and_remember(message, s)
+    try_set_faith(message, s)
 
-    # memory fast-path read
-    mem = memory_get(sess, msg)
+    # 1) memory fast-path
+    mem = lookup_memory_answer(message, s)
     if mem:
-        subj = next((k for k in sess.facts if k in _norm(msg)), None)
-        text = f"{subj} is {mem}." if subj and not mem.startswith(("is ","are ")) else (mem if subj is None else f"{subj} {mem}.")
-        return {"response": text, "sources": [], "selected_corpus": None, "remembered": None}
+        s.history.append({"role":"user","content":message})
+        s.history.append({"role":"assistant","content":mem})
+        return _json_response(mem, [], None, remembered, base)
 
-    # proactive scripture when faith known + emotional/spiritual intent
-    auto_corpus = should_use_scripture(msg, sess)
-    if auto_corpus:
-        rep = scripture_reply(msg, auto_corpus)
-        return {"response": rep["text"], "sources": rep["sources"], "selected_corpus": rep["corpus"], "remembered": None}
+    # 2) proactive scripture (faith known + emotional) OR explicit scripture ask
+    if s.faith and (is_emotional(message) or wants_scripture(message)):
+        corpus = detect_corpus(message, s)
+        sources, verse = search_scripture(message, corpus)
+        if verse:
+            s.history.append({"role":"user","content":message})
+            s.history.append({"role":"assistant","content":verse})
+            return _json_response(verse, sources, corpus, remembered, base)
 
-    # generic → OpenAI
-    text = "How can I help further?"
-    try:
-        if client:
-            r = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[{"role":"system","content": system_prompt(sess)}, {"role":"user","content": msg}],
-                temperature=0.6,
-            )
-            text = (r.choices[0].message.content or "").strip() or text
-    except Exception as e:
-        text = f"Sorry—model call failed: {e}"
-    return {"response": text, "sources": [], "selected_corpus": None, "remembered": None}
+    # 3) normal GPT
+    out = call_openai(_build_messages(s, message), stream=False)
+    reply = out if isinstance(out, str) else "".join(list(out))
+    s.history.append({"role":"user","content":message})
+    s.history.append({"role":"assistant","content":reply})
+    return _json_response(reply, [], s.faith, remembered, base)
 
-# ---------- /chat_sse_get (GET SSE; optional) ----------
-def _split_tokens(t: str) -> Iterable[str]:
-    for w in re.split(r"(\s+)", t):
-        if w: yield w
+@app.post("/chat_sse")
+async def chat_sse(request: Request):
+    body = await request.json()
+    message = (body.get("message") or "").strip()
 
-@app.get("/chat_sse_get")
-async def chat_sse_get(request: Request, q: str):
-    sid_resp = Response(); sid = get_or_create_sid(request, sid_resp); sess = SESS[sid]
-    msg = (q or "").strip()
-    maybe_set_faith(msg, sess)
+    base = Response()
+    _sid, s = get_or_create_sid(request, base)
+    remembered = parse_and_remember(message, s)
+    try_set_faith(message, s)
 
-    # allow "remember ..." via SSE too
-    remembered = parse_remember(msg)
-    if remembered: memory_put(sess, remembered)
-
-    # build response text
-    mem = memory_get(sess, msg)
-    final_meta = None
-    if mem:
-        subj = next((k for k in sess.facts if k in _norm(msg)), None)
-        full = f"{subj} is {mem}." if subj and not mem.startswith(("is ","are ")) else (mem if subj is None else f"{subj} {mem}.")
-    else:
-        auto_corpus = should_use_scripture(msg, sess)
-        if auto_corpus:
-            rep = scripture_reply(msg, auto_corpus)
-            full = rep["text"]
-            final_meta = {"sources": rep["sources"], "selected_corpus": rep["corpus"]}
-        else:
-            try:
-                if client:
-                    r = client.chat.completions.create(
-                        model=OPENAI_MODEL,
-                        messages=[{"role":"system","content": system_prompt(sess)}, {"role":"user","content": msg}],
-                        temperature=0.6,
-                    )
-                    full = (r.choices[0].message.content or "").strip() or "How can I help further?"
-                else:
-                    full = "I’m running without OpenAI credentials."
-            except Exception as e:
-                full = f"Sorry—model call failed: {e}"
-
-    async def gen():
+    def gen() -> Generator[str, None, None]:
+        # establish stream
         yield ": connected\n\n"
-        sent_any = False
-        for tok in _split_tokens(full):
-            sent_any = True
-            yield f"data: {tok}\n\n"
-        if not sent_any:
-            yield "data: \n\n"  # force flush through proxies
-        if final_meta:
-            yield f"event: sources\ndata: {json.dumps(final_meta)}\n\n"
-        yield "event: done\ndata: {}\n\n"
 
-    headers = {
-        "Cache-Control": "no-store, no-cache, no-transform",
-        "X-Accel-Buffering": "no",
-        "Connection": "keep-alive",
-    }
-    headers.update(sid_resp.headers)
+        # memory?
+        mem = lookup_memory_answer(message, s)
+        if mem:
+            s.history.append({"role":"user","content":message})
+            s.history.append({"role":"assistant","content":mem})
+            for chunk in re.findall(r".{1,220}(?:\s+|$)", mem):
+                yield sse_event(None, chunk.strip())
+            meta = json.dumps({"sources": [], "selected_corpus": s.faith, "remembered": remembered})
+            yield sse_event("sources", meta)
+            return
+
+        # scripture?
+        if s.faith and (is_emotional(message) or wants_scripture(message)):
+            corpus = detect_corpus(message, s)
+            sources, verse = search_scripture(message, corpus)
+            if verse:
+                s.history.append({"role":"user","content":message})
+                s.history.append({"role":"assistant","content":verse})
+                for chunk in re.findall(r".{1,220}(?:\s+|$)", verse):
+                    yield sse_event(None, chunk.strip())
+                meta = json.dumps({"sources": sources, "selected_corpus": corpus, "remembered": remembered})
+                yield sse_event("sources", meta)
+                return
+
+        # GPT stream
+        stream = call_openai(_build_messages(s, message), stream=True)  # type: ignore
+        buf = ""
+        for piece in stream:  # generator of text fragments
+            buf += piece
+            if re.search(r"[.!?]\s+$", buf) or len(buf) >= 140:
+                yield sse_event(None, buf)
+                buf = ""
+        if buf:
+            yield sse_event(None, buf)
+
+        s.history.append({"role":"user","content":message})
+        # trailing meta
+        meta = json.dumps({"sources": [], "selected_corpus": s.faith, "remembered": remembered})
+        yield sse_event("sources", meta)
+
+    headers = dict(base.headers)
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
-# ---------- dev run ----------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT","8000")), reload=False)
+# Optional: GET streaming (good for quick curl tests)
+@app.get("/chat_sse_get")
+def chat_sse_get(request: Request, q: str):
+    base = Response()
+    _sid, s = get_or_create_sid(request, base)
+    remembered = parse_and_remember(q, s)
+    try_set_faith(q, s)
+
+    def gen() -> Generator[str,None,None]:
+        yield ": connected\n\n"
+        if s.faith and (is_emotional(q) or wants_scripture(q)):
+            corpus = detect_corpus(q, s)
+            sources, verse = search_scripture(q, corpus)
+            if verse:
+                for chunk in re.findall(r".{1,220}(?:\s+|$)", verse):
+                    yield sse_event(None, chunk.strip())
+                yield sse_event("sources", json.dumps({"sources": sources, "selected_corpus": corpus, "remembered": remembered}))
+                return
+        for chunk in ["This is a GET stream endpoint.\n"]:
+            yield sse_event(None, chunk)
+        yield sse_event("sources", json.dumps({"sources": [], "selected_corpus": s.faith, "remembered": remembered}))
+
+    headers = dict(base.headers)
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
