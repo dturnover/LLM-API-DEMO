@@ -62,6 +62,63 @@ async function send(){
 }
 btn.onclick=send;
 msg.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); }});
+
+function streamGET(text){
+  const url = API + '/chat_sse_get?q=' + encodeURIComponent(text);
+
+  fetch(url, { credentials: 'include' })
+    .then(res => {
+      if (!res.ok || !res.body) throw new Error('HTTP '+res.status);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      // helper: handle complete SSE events in buffer
+      const pump = () => reader.read().then(({ value, done }) => {
+        if (done) {
+          append('\n'); // end nicely
+          return;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        // Split on double newline (SSE event delimiter)
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+          const raw = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+
+          // Parse minimal SSE (event:, data:)
+          const lines = raw.split('\n');
+          let eventName = 'message';
+          let dataLines = [];
+          for (const line of lines) {
+            if (line.startsWith(':')) continue;              // comment (e.g., ": connected")
+            if (line.startsWith('event:')) eventName = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5));
+          }
+          const data = dataLines.join('\n');
+
+          if (eventName === 'message') {
+            append(data);                                     // token chunk
+          } else if (eventName === 'sources') {
+            // optional tail meta
+            append('\n\n[sources attached]\n');
+          } else if (eventName === 'done') {
+            append('\n');                                     // clean line end
+          }
+        }
+        return pump();
+      });
+
+      append(': connected\n');
+      return pump();
+    })
+    .catch(err => {
+      append(`\n[stream error] ${err.message}\n`);
+    });
+}
+
+
 </script>
 </body>
 </html>
