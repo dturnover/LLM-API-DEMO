@@ -20,107 +20,80 @@
       <div class="tiny"><label><input type="checkbox" id="useSSE" checked> stream</label></div>
     </div>
   </div>
-
 <script>
-console.log("frontend build v4");
+const API = "https://llm-api-demo-5qz1.onrender.com";
+const ORIGIN = "https://dturnover.github.io"; // for reference only
 
-const API="https://llm-api-demo-5qz1.onrender.com";
-const log=document.getElementById('log'), msg=document.getElementById('msg'), btn=document.getElementById('send'), useSSE=document.getElementById('useSSE');
-function append(t){ log.textContent+=t; log.scrollTop=log.scrollHeight; }
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-async function wake(){ for(let i=0;i<40;i++){ try{const r=await fetch(API+'/',{credentials:'include'}); if(r.ok) return}catch{} await sleep(3000)} }
+const log = document.getElementById('log');
+const msg = document.getElementById('msg');
+const sendBtn = document.getElementById('send');
+const streamChk = document.getElementById('stream');
 
-function streamGET(text){
-  const url = API + '/chat_sse_get?q=' + encodeURIComponent(text);
-  const es = new EventSource(url, { withCredentials: true });
-  es.onopen = () => append(': connected\n');
-  es.onmessage = (e) => append(e.data);
-  es.addEventListener('sources', (e) => append('\n\n[sources attached]\n'));
-  es.addEventListener('done', () => es.close());
-  es.onerror = () => {
-    append(`\n[stream error] readyState=${es.readyState}\n`);
-    es.close();
-  };
-}
+function append(t){ log.textContent += t; log.scrollTop = log.scrollHeight; }
 
-async function postJSON(text){
-  const r=await fetch(API+'/chat',{
-    method:'POST', credentials:'include',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message:text})
+async function streamPost(message){
+  // POST to /chat_sse and read the response body stream
+  const res = await fetch(`${API}/chat_sse`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message })
   });
-  if(!r.ok){ throw new Error('HTTP '+r.status); }
-  return r.json();
+  if (!res.ok || !res.body) throw new Error(`status ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+
+  // SSE frames are lines that start with "data:" or "event:"
+  let carry = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    carry += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = carry.indexOf("\n")) >= 0) {
+      const line = carry.slice(0, idx).trimEnd();
+      carry = carry.slice(idx + 1);
+      if (!line) continue;              // blank line between events
+      if (line.startsWith(":")) continue; // comments like ": connected"
+      if (line.startsWith("data:")) {
+        append(line.slice(5).trimStart());
+      } else if (line.startsWith("event:")) {
+        // optional: you can watch for "sources" / "done" etc.
+      }
+    }
+  }
+  append("\n");
 }
 
 async function send(){
-  const text=msg.value.trim(); if(!text) return;
-  msg.value=""; append(`You: ${text}\n\nBot: `);
-  await wake();
-  try{
-    if(useSSE.checked){ streamGET(text); append('\n'); }
-    else{ const data=await postJSON(text); append(data.response+"\n\n"); }
-  }catch(e){ append(`[network error: ${e.message}]\n\n`); }
-}
-btn.onclick=send;
-msg.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); }});
+  const text = msg.value.trim(); if (!text) return;
+  msg.value = "";
+  append(`You: ${text}\n\nBot: `);
 
-function streamGET(text){
-  const url = API + '/chat_sse_get?q=' + encodeURIComponent(text);
-
-  fetch(url, { credentials: 'include' })
-    .then(res => {
-      if (!res.ok || !res.body) throw new Error('HTTP '+res.status);
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      // helper: handle complete SSE events in buffer
-      const pump = () => reader.read().then(({ value, done }) => {
-        if (done) {
-          append('\n'); // end nicely
-          return;
-        }
-        buffer += decoder.decode(value, { stream: true });
-
-        // Split on double newline (SSE event delimiter)
-        let idx;
-        while ((idx = buffer.indexOf('\n\n')) !== -1) {
-          const raw = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
-
-          // Parse minimal SSE (event:, data:)
-          const lines = raw.split('\n');
-          let eventName = 'message';
-          let dataLines = [];
-          for (const line of lines) {
-            if (line.startsWith(':')) continue;              // comment (e.g., ": connected")
-            if (line.startsWith('event:')) eventName = line.slice(6).trim();
-            else if (line.startsWith('data:')) dataLines.push(line.slice(5));
-          }
-          const data = dataLines.join('\n');
-
-          if (eventName === 'message') {
-            append(data);                                     // token chunk
-          } else if (eventName === 'sources') {
-            // optional tail meta
-            append('\n\n[sources attached]\n');
-          } else if (eventName === 'done') {
-            append('\n');                                     // clean line end
-          }
-        }
-        return pump();
+  try {
+    if (streamChk.checked) {
+      // Use POST streaming instead of GET + EventSource
+      await streamPost(text);
+    } else {
+      // Fallback: JSON (non-stream)
+      const r = await fetch(`${API}/chat`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text })
       });
-
-      append(': connected\n');
-      return pump();
-    })
-    .catch(err => {
-      append(`\n[stream error] ${err.message}\n`);
-    });
+      const j = await r.json();
+      append(j.response + "\n\n");
+    }
+  } catch (e) {
+    append(`[stream error] ${e.message}\n\n`);
+  }
 }
 
-
+sendBtn.addEventListener('click', send);
+msg.addEventListener('keydown', (e)=>{ if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }});
+console.log("frontend build: POST-stream");
 </script>
+
 </body>
 </html>
