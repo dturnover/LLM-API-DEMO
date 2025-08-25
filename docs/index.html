@@ -38,11 +38,21 @@
   const clearBtn = document.getElementById("clear");
   const streamBox = document.getElementById("stream");
 
+  // Simple client-side session id (used only for /chat in Phase 5)
+  const getSID = () => {
+    let sid = localStorage.getItem("sid");
+    if (!sid) {
+      sid = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
+      localStorage.setItem("sid", sid);
+    }
+    return sid;
+  };
+
   const append = (role, text) => { log.textContent += `\n${role}: ${text}`; log.scrollTop = log.scrollHeight; };
 
   healthBtn.onclick = async () => {
     try {
-      const r = await fetch(`${API}/health`, { method: "GET" }); // no credentials needed
+      const r = await fetch(`${API}/health`, { method: "GET" });
       append("Health", (await r.text()).trim());
     } catch (e) { append("Health", `[error] ${e?.message || e}`); }
   };
@@ -57,14 +67,18 @@
     const useStream = !!(streamBox && streamBox.checked);
 
     if (!useStream) {
-      // Phase 1–2: JSON POST
+      // JSON POST with X-Session-Id header (Phase 5 memory/faith)
       try {
         const r = await fetch(`${API}/chat`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-Session-Id": getSID(),
+          },
           body: JSON.stringify({ message: text })
         });
         const j = await r.json();
+        if (j?.sid) localStorage.setItem("sid", j.sid);
         append("Bot", j?.response ?? "[no response]");
       } catch (e) {
         append("Bot", `[network error] ${e?.message || e}`);
@@ -72,9 +86,9 @@
       return;
     }
 
-    // Phase 3–4: SSE via EventSource (GET)
+    // Streaming via EventSource (GET). We pass sid as query for future phases.
     try {
-      const url = `${API}/chat_sse?q=${encodeURIComponent(text)}`;
+      const url = `${API}/chat_sse?q=${encodeURIComponent(text)}&sid=${encodeURIComponent(getSID())}`;
       const es = new EventSource(url, { withCredentials: false });
       let opened = false;
 
@@ -91,17 +105,16 @@
         }
       };
 
-      // safety: close if nothing after 60s
       setTimeout(() => { if (!opened) { es.close(); append("dbg", "[timeout]"); } }, 60000);
     } catch (e) {
       append("Bot", `[stream error] ${e?.message || e}`);
     }
   };
 
-  // Wake the backend quietly on load (helps avoid cold-start hiccups)
+  // Warm backend on load
   (async () => { try { await fetch(`${API}/health`, { mode: "no-cors" }); } catch {} })();
-  // Ctrl/Cmd+Enter to send
-  msgEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) sendBtn.onclick(); });
+  // Ctrl/Cmd+Enter
+  msgEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey||e.ctrlKey)) sendBtn.onclick(); });
   </script>
 </body>
 </html>
