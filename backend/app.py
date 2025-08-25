@@ -1,6 +1,6 @@
 # app.py
 import os, re, json, uuid
-from typing import Dict, List, Optional, Any, Tuple, Generator
+from typing import Dict, List, Optional, Any, Tuple, Generator, Iterable
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -38,7 +38,7 @@ def get_or_create_sid(request: Request, response: Response) -> Tuple[str, Sessio
         SESSIONS[sid] = SessionState()
     return sid, SESSIONS[sid]
 
-# ========= RAG (very small + fast) =========
+# ========= RAG (tiny + fast) =========
 from pathlib import Path
 RAG_ROOT = Path(__file__).parent / "rag_data"
 CORPUS_FILES = {"bible":"bible.jsonl", "quran":"quran.jsonl", "sutta_pitaka":"sutta_pitaka.jsonl"}
@@ -67,7 +67,7 @@ def _load_corpus(corpus: str) -> List[Dict[str, Any]]:
 def diag_rag_counts() -> Dict[str,int]:
     return {c: len(_load_corpus(c)) for c in CORPUS_FILES}
 
-def search_scripture(query: str, corpus: str, k: int = 3) -> Tuple[List[Dict[str,Any]], Optional[str]]:
+def search_scripture(query: str, corpus: str, k: int = 3):
     docs = _load_corpus(corpus)
     if not docs: return [], None
     terms = [w for w in re.sub(r"[^a-z0-9\s]", " ", query.lower()).split() if len(w)>2]
@@ -80,7 +80,6 @@ def search_scripture(query: str, corpus: str, k: int = 3) -> Tuple[List[Dict[str
     scored.sort(key=lambda x:x[0], reverse=True)
     tops = [d for _,d in scored[:k]]
     best = tops[0].get("text","")
-    # return first sentence-ish as a "verse-ish" pull, capped
     verse = re.split(r"(?<=[.!?])\s+", best.strip())[0]
     if len(verse)>220:
         verse = verse[:200].rsplit(" ",1)[0]+"..."
@@ -164,18 +163,18 @@ def _build_messages(s: SessionState, user: str) -> List[Dict[str,str]]:
     return msgs
 
 # ========= OpenAI call =========
-def call_openai(messages: List[Dict[str,str]], stream: bool) -> Generator[str,None,str] | str:
+def call_openai(messages: List[Dict[str,str]], stream: bool) -> Iterable[str] | str:
     if not (_HAS_OPENAI and OPENAI_API_KEY):
         txt = "⚠️ OpenAI disabled on server; running in dev mode."
         if stream:
-            def _g():  # type: ignore
+            def _g():
                 yield txt
             return _g()
         return txt
     client = OpenAI(api_key=OPENAI_API_KEY)
     if stream:
         resp = client.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.5, stream=True)
-        def _gen():  # type: ignore
+        def _gen():
             for ev in resp:
                 chunk = ev.choices[0].delta.content or ""
                 if chunk: yield chunk
@@ -187,13 +186,11 @@ def call_openai(messages: List[Dict[str,str]], stream: bool) -> Generator[str,No
 # ========= App + CORS =========
 ALLOWED_ORIGINS = {
     "https://dturnover.github.io",
-    # add locals if needed:
     "http://localhost:3000", "http://127.0.0.1:3000",
     "http://localhost:5500", "http://127.0.0.1:5500",
 }
 
 app = FastAPI()
-# Base CORS (we still echo origin below so cookies work)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(ALLOWED_ORIGINS),
@@ -204,7 +201,7 @@ app.add_middleware(
     max_age=600,
 )
 
-# Echo Origin (some proxies strip framework CORS; this forces the header)
+# Echo Origin (ensure ACAO survives proxies)
 @app.middleware("http")
 async def echo_origin_header(request: Request, call_next):
     origin = request.headers.get("origin", "")
@@ -239,7 +236,6 @@ def diag():
 
 def _json_response(resp_text: str, sources: List[Dict[str,Any]], corpus: Optional[str], remembered: Optional[Dict[str,str]], base: Response) -> JSONResponse:
     jr = JSONResponse({"response": resp_text, "sources": sources, "selected_corpus": corpus, "remembered": remembered})
-    # forward cookie header from get_or_create_sid response
     for k, v in base.headers.items():
         jr.headers[k] = v
     return jr
@@ -254,14 +250,12 @@ async def chat(request: Request):
     remembered = parse_and_remember(message, s)
     try_set_faith(message, s)
 
-    # 1) memory fast-path
     mem = lookup_memory_answer(message, s)
     if mem:
         s.history.append({"role":"user","content":message})
         s.history.append({"role":"assistant","content":mem})
         return _json_response(mem, [], None, remembered, base)
 
-    # 2) proactive scripture (faith known + emotional) OR explicit scripture ask
     if s.faith and (is_emotional(message) or wants_scripture(message)):
         corpus = detect_corpus(message, s)
         sources, verse = search_scripture(message, corpus)
@@ -270,91 +264,67 @@ async def chat(request: Request):
             s.history.append({"role":"assistant","content":verse})
             return _json_response(verse, sources, corpus, remembered, base)
 
-    # 3) normal GPT
     out = call_openai(_build_messages(s, message), stream=False)
     reply = out if isinstance(out, str) else "".join(list(out))
     s.history.append({"role":"user","content":message})
     s.history.append({"role":"assistant","content":reply})
     return _json_response(reply, [], s.faith, remembered, base)
 
-@app.post("/chat_sse")
-async def chat_sse(request: Request):
-    body = await request.json()
-    message = (body.get("message") or "").strip()
+# ---------- Unified SSE route: supports GET and POST ----------
+def _stream_message(message: str, s: SessionState, remembered: Optional[Dict[str,str]]) -> Generator[str,None,None]:
+    yield ": connected\n\n"
 
+    mem = lookup_memory_answer(message, s)
+    if mem:
+        s.history.append({"role":"user","content":message})
+        s.history.append({"role":"assistant","content":mem})
+        for chunk in re.findall(r".{1,220}(?:\s+|$)", mem):
+            yield sse_event(None, chunk.strip())
+        yield sse_event("sources", json.dumps({"sources": [], "selected_corpus": s.faith, "remembered": remembered}))
+        return
+
+    if s.faith and (is_emotional(message) or wants_scripture(message)):
+        corpus = detect_corpus(message, s)
+        sources, verse = search_scripture(message, corpus)
+        if verse:
+            s.history.append({"role":"user","content":message})
+            s.history.append({"role":"assistant","content":verse})
+            for chunk in re.findall(r".{1,220}(?:\s+|$)", verse):
+                yield sse_event(None, chunk.strip())
+            yield sse_event("sources", json.dumps({"sources": sources, "selected_corpus": corpus, "remembered": remembered}))
+            return
+
+    stream = call_openai(_build_messages(s, message), stream=True)  # type: ignore
+    buf = ""
+    for piece in stream:
+        buf += piece
+        if re.search(r"[.!?]\s+$", buf) or len(buf) >= 140:
+            yield sse_event(None, buf)
+            buf = ""
+    if buf:
+        yield sse_event(None, buf)
+
+    s.history.append({"role":"user","content":message})
+    yield sse_event("sources", json.dumps({"sources": [], "selected_corpus": s.faith, "remembered": remembered}))
+
+@app.api_route("/chat_sse", methods=["GET", "POST"])
+async def chat_sse(request: Request, q: Optional[str] = None):
     base = Response()
     _sid, s = get_or_create_sid(request, base)
+
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        message = (body.get("message") or "").strip()
+    else:
+        message = (q or "").strip()
+
     remembered = parse_and_remember(message, s)
     try_set_faith(message, s)
 
-    def gen() -> Generator[str, None, None]:
-        # establish stream
-        yield ": connected\n\n"
-
-        # memory?
-        mem = lookup_memory_answer(message, s)
-        if mem:
-            s.history.append({"role":"user","content":message})
-            s.history.append({"role":"assistant","content":mem})
-            for chunk in re.findall(r".{1,220}(?:\s+|$)", mem):
-                yield sse_event(None, chunk.strip())
-            meta = json.dumps({"sources": [], "selected_corpus": s.faith, "remembered": remembered})
-            yield sse_event("sources", meta)
-            return
-
-        # scripture?
-        if s.faith and (is_emotional(message) or wants_scripture(message)):
-            corpus = detect_corpus(message, s)
-            sources, verse = search_scripture(message, corpus)
-            if verse:
-                s.history.append({"role":"user","content":message})
-                s.history.append({"role":"assistant","content":verse})
-                for chunk in re.findall(r".{1,220}(?:\s+|$)", verse):
-                    yield sse_event(None, chunk.strip())
-                meta = json.dumps({"sources": sources, "selected_corpus": corpus, "remembered": remembered})
-                yield sse_event("sources", meta)
-                return
-
-        # GPT stream
-        stream = call_openai(_build_messages(s, message), stream=True)  # type: ignore
-        buf = ""
-        for piece in stream:  # generator of text fragments
-            buf += piece
-            if re.search(r"[.!?]\s+$", buf) or len(buf) >= 140:
-                yield sse_event(None, buf)
-                buf = ""
-        if buf:
-            yield sse_event(None, buf)
-
-        s.history.append({"role":"user","content":message})
-        # trailing meta
-        meta = json.dumps({"sources": [], "selected_corpus": s.faith, "remembered": remembered})
-        yield sse_event("sources", meta)
-
     headers = dict(base.headers)
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
-
-# Optional: GET streaming (good for quick curl tests)
-@app.get("/chat_sse_get")
-def chat_sse_get(request: Request, q: str):
-    base = Response()
-    _sid, s = get_or_create_sid(request, base)
-    remembered = parse_and_remember(q, s)
-    try_set_faith(q, s)
-
-    def gen() -> Generator[str,None,None]:
-        yield ": connected\n\n"
-        if s.faith and (is_emotional(q) or wants_scripture(q)):
-            corpus = detect_corpus(q, s)
-            sources, verse = search_scripture(q, corpus)
-            if verse:
-                for chunk in re.findall(r".{1,220}(?:\s+|$)", verse):
-                    yield sse_event(None, chunk.strip())
-                yield sse_event("sources", json.dumps({"sources": sources, "selected_corpus": corpus, "remembered": remembered}))
-                return
-        for chunk in ["This is a GET stream endpoint.\n"]:
-            yield sse_event(None, chunk)
-        yield sse_event("sources", json.dumps({"sources": [], "selected_corpus": s.faith, "remembered": remembered}))
-
-    headers = dict(base.headers)
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+    return StreamingResponse(_stream_message(message, s, remembered),
+                             media_type="text/event-stream", headers=headers)
+# --------------------------------------------------------------
