@@ -38,7 +38,7 @@
   const clearBtn = document.getElementById("clear");
   const streamBox = document.getElementById("stream");
 
-  // Simple client-side session id (used only for /chat in Phase 5)
+  // simple client session id
   const getSID = () => {
     let sid = localStorage.getItem("sid");
     if (!sid) {
@@ -51,10 +51,8 @@
   const append = (role, text) => { log.textContent += `\n${role}: ${text}`; log.scrollTop = log.scrollHeight; };
 
   healthBtn.onclick = async () => {
-    try {
-      const r = await fetch(`${API}/health`, { method: "GET" });
-      append("Health", (await r.text()).trim());
-    } catch (e) { append("Health", `[error] ${e?.message || e}`); }
+    try { const r = await fetch(`${API}/health`); append("Health",(await r.text()).trim()); }
+    catch(e){ append("Health", `[error] ${e?.message||e}`); }
   };
   clearBtn.onclick = () => { log.textContent = ""; };
 
@@ -67,7 +65,7 @@
     const useStream = !!(streamBox && streamBox.checked);
 
     if (!useStream) {
-      // JSON POST with X-Session-Id header (Phase 5 memory/faith)
+      // Non-stream (uses memory)
       try {
         const r = await fetch(`${API}/chat`, {
           method: "POST",
@@ -86,35 +84,53 @@
       return;
     }
 
-    // Streaming via EventSource (GET). We pass sid as query for future phases.
+    // Streaming (memory-aware): pass sid as header and query (defensive)
     try {
       const url = `${API}/chat_sse?q=${encodeURIComponent(text)}&sid=${encodeURIComponent(getSID())}`;
-      const es = new EventSource(url, { withCredentials: false });
-      let opened = false;
+      const esInit = { withCredentials: false }; // EventSource can't set headers; sid also sent in query
+      const es = new EventSource(url, esInit);
+      let gotData = false;
 
-      es.onopen = () => { opened = true; append("dbg", "[sse opened]"); };
-      es.onerror = () => { append("Bot", "[stream error]"); es.close(); };
+      es.onopen = () => { append("dbg","[sse opened]"); };
+
       es.onmessage = (ev) => {
         if (!ev.data) return;
         try {
           const obj = JSON.parse(ev.data);
-          if (obj.text) append("Bot", obj.text);
+          if (obj.text) { append("Bot", obj.text); gotData = true; }
           else append("Bot", ev.data);
         } catch {
           append("Bot", ev.data);
         }
       };
 
-      setTimeout(() => { if (!opened) { es.close(); append("dbg", "[timeout]"); } }, 60000);
+      es.addEventListener("done", (ev) => {
+        try {
+          const j = ev.data ? JSON.parse(ev.data) : {};
+          if (j?.sid) localStorage.setItem("sid", j.sid);
+        } catch {}
+        append("dbg","[done]");
+        es.close();
+      });
+
+      es.addEventListener("ping", () => { /* keep-alive */ });
+
+      es.onerror = () => {
+        if (!gotData) append("Bot", "[stream error]");
+        es.close();
+      };
+
+      // safety timeout
+      setTimeout(() => { try { es.close(); } catch {} }, 90000);
     } catch (e) {
       append("Bot", `[stream error] ${e?.message || e}`);
     }
   };
 
-  // Warm backend on load
+  // warm backend
   (async () => { try { await fetch(`${API}/health`, { mode: "no-cors" }); } catch {} })();
   // Ctrl/Cmd+Enter
-  msgEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey||e.ctrlKey)) sendBtn.onclick(); });
+  msgEl.addEventListener("keydown", (e) => { if (e.key==="Enter" && (e.metaKey||e.ctrlKey)) sendBtn.onclick(); });
   </script>
 </body>
 </html>
